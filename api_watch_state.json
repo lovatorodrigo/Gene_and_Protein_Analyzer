@@ -1,0 +1,29 @@
+{
+  "uniprot_rest_release": {
+    "url": "https://rest.uniprot.org/uniprotkb/P02458.json",
+    "status": 200,
+    "seen_at": "2025-08-21T10:41:20",
+    "headers": {
+      "X-UniProt-Release": "2025_03",
+      "X-UniProt-Release-Date": "18-June-2025"
+    }
+  },
+  "proteins_api_release_notes": {
+    "url": "https://www.ebi.ac.uk/proteins/api/doc/release_notes.html",
+    "status": 200,
+    "seen_at": "2025-08-21T10:41:21",
+    "sha256": "fc79d953a3171314722d75aaf4c8aa21ed9c9d771023e92a2b4a229857e37cc7"
+  },
+  "interpro_swagger": {
+    "url": "https://www.ebi.ac.uk/interpro/api/static_files/swagger/",
+    "status": 200,
+    "seen_at": "2025-08-21T10:41:21",
+    "sha256": "d12a6b74e9ff1e015f0e8ffc636ac16b0e02fc8d6aee3a9ef91260354e3740ec"
+  },
+  "pdbe_api_doc": {
+    "url": "https://www.ebi.ac.uk/pdbe/pdbe-rest-api",
+    "status": 200,
+    "seen_at": "2025-08-21T10:41:21",
+    "sha256": "1fd99ae103d0bfff01973c4a48a1be8d9ab139aa1fbe7ba6b08cda1d5a13d794"
+  }
+}

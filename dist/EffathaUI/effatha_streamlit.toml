@@ -1,0 +1,12 @@
+[server]
+headless = false
+port = 8502
+address = "127.0.0.1"
+fileWatcherType = "none"
+
+[global]
+developmentMode = false
+
+[browser]
+gatherUsageStats = false
+serverAddress = "localhost"

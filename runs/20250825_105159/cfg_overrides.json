@@ -1,0 +1,63 @@
+{
+  "input": {
+    "source": "uniprot",
+    "uniprot_acc": "P02458",
+    "pdb_id": "5xnl",
+    "ncbi_protein_acc": "NP_001609.2",
+    "gene": {
+      "id_type": "entrez",
+      "id": "1956",
+      "symbol": "",
+      "taxid": 9606,
+      "isoform_policy": "longest"
+    }
+  },
+  "external_layers": {
+    "uniprot_variant": {
+      "enable": true
+    },
+    "variation_api": {
+      "enable": true
+    }
+  },
+  "blast": {
+    "enable": true
+  },
+  "variation_filters": {
+    "enabled": true,
+    "min_af": 0.01,
+    "clinical": {
+      "allow": [
+        "benign",
+        "likely_benign"
+      ],
+      "allow_if_conflicting": true,
+      "allow_uncertain": true
+    },
+    "evidence": {
+      "assertion": "prefer_manual",
+      "treat_missing_as": "include"
+    },
+    "predictions": {
+      "sift_allow": [
+        "tolerated",
+        "tolerated_low_confidence",
+        "deleterious"
+      ],
+      "polyphen_allow": [
+        "benign",
+        "possibly_benign",
+        "possibly_damaging",
+        "damaging"
+      ],
+      "require_both": true
+    },
+    "include_blast_in_filtered": true
+  },
+  "output": {
+    "report_txt": "C:\\Users\\rodri\\PycharmProjects\\analyze_uniprot.py\\runs\\20250825_105159\\report_P02458_20250825_105159.txt",
+    "export_regions_csv": "C:\\Users\\rodri\\PycharmProjects\\analyze_uniprot.py\\runs\\20250825_105159\\regions_P02458_20250825_105159.csv",
+    "export_csv": "C:\\Users\\rodri\\PycharmProjects\\analyze_uniprot.py\\runs\\20250825_105159\\variants_blast_P02458_20250825_105159.csv",
+    "artifacts_dir": "C:\\Users\\rodri\\PycharmProjects\\analyze_uniprot.py\\runs\\20250825_105159"
+  }
+}
