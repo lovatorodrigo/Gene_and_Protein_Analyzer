@@ -5,6 +5,7 @@
 # - lê artifacts/context_summary.json para renderizar cards/seqs/downloads.
 # - mantém estado entre reruns; botão "Limpar" só zera entradas e resultados.
 # - blocos de sequência usam st.code() (um só) com wrap visual via CSS e cópia sem quebras.
+# - Gera automaticamente um arquivo "Prompt Effatha" (.md) com base no contexto + objetivo informado.
 
 import os
 import sys
@@ -113,11 +114,14 @@ def run_subprocess(py_exe, script_path, cwd):
     return proc.returncode, proc.stdout, proc.stderr
 
 # estado p/ manter último run
-def save_session(run_dir, context, paths, enable_blast):
+def save_session(run_dir, context, paths, enable_blast, prompt_goal, mech_flags):
     st.session_state["last_run_dir"] = str(run_dir)
     st.session_state["last_context"] = context
     st.session_state["last_paths"] = paths
     st.session_state["last_enable_blast"] = bool(enable_blast)
+    # também lembrar últimas preferências de prompt
+    st.session_state["last_prompt_goal"] = prompt_goal
+    st.session_state["last_mech_flags"] = mech_flags
 
 def clear_results_and_inputs():
     # Limpa apenas as entradas de fonte e os resultados
@@ -128,6 +132,144 @@ def clear_results_and_inputs():
     for k in ("last_run_dir","last_context","last_paths","last_enable_blast"):
         if k in st.session_state:
             st.session_state[k] = None
+
+# -------------------------------------
+# Prompt Effatha — geração de arquivo .md
+# -------------------------------------
+def _list_regions_lines(context):
+    lines = []
+    for r in context.get("regions", []) or []:
+        note = f" — {r.get('note','')}" if r.get('note') else ""
+        lines.append(f"- {r.get('source')}:{r.get('type')} {r.get('start')}-{r.get('end')}{note}")
+    return "\\n".join(lines) if lines else "(sem regiões)"
+
+def _seq_block(label, seq_text):
+    if not seq_text:
+        return ""
+    return f"**{label}**\\n\\n```\n{seq_text}\n```\\n"
+
+def _render_region_sequences(context):
+    # prioriza OBS/FILTRADO; se ausentes, usa aa_regions (cru)
+    aa_obs = {(a["tag"], a["start"], a["end"]): a["aa"] for a in context.get("aa_regions_obs", [])}
+    aa_fil = {(a["tag"], a["start"], a["end"]): a["aa"] for a in context.get("aa_regions_filtered", [])}
+    aa_any = {(a["tag"], a["start"], a["end"]): a["aa"] for a in context.get("aa_regions", [])}
+
+    blocks = []
+    for seg in context.get("nt_segments", []) or []:
+        tag = seg["tag"]; start = seg["start"]; end = seg["end"]
+        note = seg.get("note") or ""
+        header = f"### {tag} {start}-{end}"
+        if note:
+            header += f" — {note}"
+        aa1 = aa_obs.get((tag,start,end), "")
+        aa2 = aa_fil.get((tag,start,end), "")
+        aa3 = "" if (aa1 or aa2) else aa_any.get((tag,start,end), "")
+        dna = seg.get("dna","")
+        mrna = seg.get("mrna","")
+        section = [header, ""]
+        section.append(_seq_block("AA (observado)", aa1))
+        section.append(_seq_block("AA (filtrado)", aa2))
+        section.append(_seq_block("AA", aa3))
+        section.append(_seq_block("DNA", dna))
+        section.append(_seq_block("mRNA", mrna))
+        blocks.append("\\n".join([x for x in section if x]))
+    return "\\n\\n".join(blocks) if blocks else "_Sem sequências por região disponíveis._"
+
+def build_effatha_prompt_md(*, context, treatment_goal, mech_flags, report_path):
+    """
+    Constrói o conteúdo Markdown do Prompt Effatha para uso em GPT Pro.
+    mech_flags: dict com chaves 'aproximar', 'distanciar', 'mimetizar' (bool)
+    """
+    protein = context.get("protein", {}) or {}
+    blast = context.get("blast", {}) or {}
+    layers = context.get("layers", {}) or {}
+
+    allow_list = [k for k,v in mech_flags.items() if v]
+    allow_txt = ", ".join(allow_list) if allow_list else "aproximar, distanciar e mimetizar"
+
+    region_lines = _list_regions_lines(context)
+    region_seq_md = _render_region_sequences(context)
+
+    report_tail = ""
+    try:
+        if report_path and Path(report_path).exists():
+            txt = Path(report_path).read_text(encoding="utf-8", errors="ignore")
+            # pega início do relatório para contexto (limita tamanho)
+            head = txt.strip()
+            if len(head) > 12000:
+                head = head[:12000] + "\\n... (trecho truncado)"
+            report_tail = f"\\n\\n---\\n### Trecho do relatório (.txt)\\n```\n{head}\n```"
+    except Exception:
+        pass
+
+    md = f"""# Prompt Effatha — Análise e Priorização de Sequências (para GPT Pro)
+
+**Objetivo do tratamento:** {treatment_goal or "(não informado)"}  
+**Mecanismos permitidos nesta análise:** {allow_txt}
+
+## 0) Papel da IA
+Você é uma IA especialista em biologia molecular/sistemas, treinada para avaliar **potencial de intervenção por frequências Effatha** em proteínas/genes.  
+Para **cada sequência** fornecida a seguir, você deve:
+1. Classificar o **potencial** para Effatha como **"Alto"**, **"Moderado"**, **"Baixo"** ou **"Sem potencial"** (obrigatório considerar "Sem potencial").  
+2. Indicar **qual mecanismo Effatha** é mais promissor (**aproximar**, **distanciar**, **mimetizar**) e por quê. Use apenas mecanismos **permitidos** acima.  
+3. Descrever o **raciocínio** (máx. ~8 linhas por sequência), citando: função/região, contexto estrutural, variantes presentes (`[ref/alt/...]`), efeitos esperados, riscos/limitações.  
+4. Retornar uma **priorização global** (Top N) com justificativas curtas, e **descartar** explicitamente alvos com “Sem potencial” (com uma frase de justificativa para economizar recursos).
+5. Quando fizer sentido, sugerir **controles e próximos passos**.
+
+> Observação: esta IA **não precisa** reproduzir exatamente o processo interno do Analyzer. Ela apenas precisa **entender** como as sequências foram derivadas (flancos, colchetes, etc.) para interpretar corretamente os blocos e realizar uma avaliação mais ampla.
+
+## 1) Contexto do caso
+- **Acesso**: {protein.get('accession','?')}
+- **Organismo**: {protein.get('organism','?')} (taxid={protein.get('taxid','?')})
+- **Tamanho (aa)**: {protein.get('length','?')}
+- **Nome / Descrição**: {protein.get('name','')}
+- **Camadas ativas (no Analyzer, para gerar contexto)**:
+  - UniProt VARIANT = { "ON" if layers.get("uniprot_variant_enabled") else "OFF" }
+  - Proteins Variation API = { "ON" if layers.get("proteins_variation_enabled") else "OFF" }
+  - BLAST = { "ON" if layers.get("blast_enabled") else "OFF" }
+- **BLAST (resumo)**: janelas={blast.get('windows',0)}, filtro={blast.get('filter','None')}, pos_var(bast)= {blast.get('variant_positions_blast',0)}
+
+## 2) Como as sequências foram derivadas (Gene & Protein Analyzer)
+- Regiões vêm de **UniProt/Pfam/NCBI** e podem incluir notas (ligantes, íons, domínios, **SITES** etc.).
+- Cada região é expandida por **flancos** definidos (ex.: ±5 aa), e janelas são geradas/centralizadas.
+- Sequências de AA podem conter **colchetes** com variantes ou alternativas, p.ex.: `A[L/E]K` (ref/alt/...).
+- Também disponibilizamos **DNA** e **mRNA** correspondentes à região (de CDS real quando mapeado; senão, retrotradução).
+- O objetivo **não** é repetir o pré-processamento, mas **interpretar** corretamente estes blocos.
+
+## 3) Regiões-alvo (após expansão)
+{region_lines}
+
+## 4) Sequências por região (AA + DNA/mRNA)
+{region_seq_md}
+
+## 5) Mecanismos Effatha — definição operacional (resumo)
+- **Aproximar**: reduzir distâncias efetivas/funcionais entre átomos/resíduos/regiões para **alterar conformação** (ex.: bloquear sítio ativo/ligação), **expor** ou **ocultar** elementos críticos, **inibir expressão gênica** (casos similares a RNAi observados em *T. rubrum*), ou **modular** interação PPI.  
+- **Distanciar**: aumentar distâncias/afrouxar contatos para **expor sítios catalíticos**, **relaxar fibras** ou **facilitar interações** desejadas.  
+- **Mimetizar**: simular frequência de ligantes/peptídeos/íon metálico para **induzir resposta semelhante** à presença química real **sem** adicionar a molécula.
+
+## 6) Tarefa
+Para **cada bloco de região** acima, retorne um item com:
+- **Potencial Effatha**: Alto / Moderado / Baixo / **Sem potencial**.
+- **Mecanismo(s) sugerido(s)** (restrito aos permitidos): Aproximar / Distanciar / Mimetizar.
+- **Justificativa** (máx. ~8 linhas; cite função/ligante/domínio, variantes entre colchetes, efeitos esperados e riscos).
+- **Teste/controle recomendado** (1–2 linhas).
+Ao final, liste um **ranking dos melhores alvos** e uma **lista de descarte** (sem potencial) com 1 linha de motivo por item.
+
+---
+**Observações finais do operador**: Se necessário, considere a **não viabilidade experimental** (ex.: ausência de papel funcional claro, região fora do contexto da doença, variantes incompatíveis com o objetivo, etc.).{report_tail}
+"""
+    return md
+
+def write_prompt_file(run_dir, *, context, treatment_goal, mech_flags, report_path, slug, ts):
+    md = build_effatha_prompt_md(context=context,
+                                 treatment_goal=treatment_goal,
+                                 mech_flags=mech_flags,
+                                 report_path=report_path)
+    prompt_md_path = Path(run_dir) / f"prompt_effatha_{slug}_{ts}.md"
+    prompt_txt_path = Path(run_dir) / f"prompt_effatha_{slug}_{ts}.txt"
+    prompt_md_path.write_text(md, encoding="utf-8")
+    prompt_txt_path.write_text(md, encoding="utf-8")
+    return str(prompt_md_path), str(prompt_txt_path)
 
 # -------------------------------
 # UI — Sidebar / Parâmetros (com keys p/ podermos limpar)
@@ -214,6 +356,20 @@ with st.sidebar:
     st.subheader("Saída")
     st.number_input("Largura de linha (visualização)", min_value=40, max_value=200, step=2, value=80, key="wrap_width")
     st.text_input("Pasta de artefatos", value="runs", key="artifacts_dir")
+
+    st.markdown("---")
+    st.subheader("Prompt Effatha — parâmetros")
+    default_goal = st.session_state.get("last_prompt_goal", "Descrever impacto esperado e priorizar alvos para o tratamento especificado.")
+    st.text_area("🎯 Objetivo do tratamento (texto livre)", value=default_goal, key="treatment_goal", height=120)
+    mech = st.session_state.get("last_mech_flags", {"aproximar": True, "distanciar": True, "mimetizar": True})
+    cma, cmd, cmm = st.columns(3)
+    with cma:
+        st.checkbox("Permitir Aproximar", value=bool(mech.get("aproximar", True)), key="allow_aproximar")
+    with cmd:
+        st.checkbox("Permitir Distanciar", value=bool(mech.get("distanciar", True)), key="allow_distanciar")
+    with cmm:
+        st.checkbox("Permitir Mimetizar", value=bool(mech.get("mimetizar", True)), key="allow_mimetizar")
+
     btn = st.button("🚀 Executar análise", type="primary", key="run_btn")
 
 tab_resumo, tab_regioes, tab_seqs, tab_logs, tab_downloads = st.tabs(
@@ -374,6 +530,17 @@ def render_outputs(context, paths, enable_blast_flag):
             if ctx_path and ctx_path.exists():
                 st.download_button("Baixar contexto (.json)", data=ctx_path.read_bytes(),
                                    file_name=ctx_path.name, mime="application/json")
+
+            # NOVO: Prompt Effatha
+            pmd = Path(paths.get("prompt_md","")) if paths else None
+            ptxt = Path(paths.get("prompt_txt","")) if paths else None
+            if pmd and pmd.exists():
+                st.download_button("Baixar Prompt Effatha (.md)", data=pmd.read_bytes(),
+                                   file_name=pmd.name, mime="text/markdown")
+            if ptxt and ptxt.exists():
+                st.download_button("Baixar Prompt Effatha (.txt)", data=ptxt.read_bytes(),
+                                   file_name=ptxt.name, mime="text/plain")
+
         except Exception as e:
             st.error(f"Erro ao preparar downloads: {e}")
 
@@ -388,12 +555,10 @@ if st.session_state.get("run_btn"):
 
     run_dir = make_run_dir(st.session_state.get("artifacts_dir") or "runs")
 
-
     # === nomes de arquivos com ID + timestamp ===
     def _sanitize(s: str) -> str:
         # mantém apenas letras/números e - _ .
         return "".join(ch for ch in (s or "") if ch.isalnum() or ch in ("-", "_", ".")).strip() or "run"
-
 
     src_label = st.session_state["source_choice"]
     if src_label == "UniProt":
@@ -487,8 +652,37 @@ if st.session_state.get("run_btn"):
         except Exception as e:
             tab_resumo.error(f"Falha ao ler context_summary.json: {e}")
 
-    paths = {"report": report_path, "regions_csv": regions_csv_path, "blast_csv": blast_csv_path}
-    save_session(run_dir, context, paths, st.session_state.get("enable_blast", False))
+    # NOVO: gerar Prompt Effatha automaticamente (se tivermos contexto)
+    treatment_goal = st.session_state.get("treatment_goal","").strip()
+    mech_flags = {
+        "aproximar": bool(st.session_state.get("allow_aproximar", True)),
+        "distanciar": bool(st.session_state.get("allow_distanciar", True)),
+        "mimetizar": bool(st.session_state.get("allow_mimetizar", True)),
+    }
+    prompt_md_path = None
+    prompt_txt_path = None
+    if context:
+        try:
+            prompt_md_path, prompt_txt_path = write_prompt_file(
+                run_dir,
+                context=context,
+                treatment_goal=treatment_goal,
+                mech_flags=mech_flags,
+                report_path=report_path,
+                slug=slug,
+                ts=ts,
+            )
+        except Exception as e:
+            tab_resumo.warning(f"Falha ao gerar Prompt Effatha: {e}")
+
+    paths = {
+        "report": report_path,
+        "regions_csv": regions_csv_path,
+        "blast_csv": blast_csv_path,
+        "prompt_md": (prompt_md_path or ""),
+        "prompt_txt": (prompt_txt_path or ""),
+    }
+    save_session(run_dir, context, paths, st.session_state.get("enable_blast", False), treatment_goal, mech_flags)
 
     if context:
         render_outputs(context, paths, st.session_state.get("enable_blast", False))
