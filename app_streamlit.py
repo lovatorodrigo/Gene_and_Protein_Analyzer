@@ -133,7 +133,7 @@ def clear_results_and_inputs():
 # UI — Sidebar / Parâmetros (com keys p/ podermos limpar)
 # -------------------------------
 st.set_page_config(page_title="Effatha — Functional Regions", layout="wide")
-st.title("Effatha · Gene & Protein Analyzer")
+st.title("Gene & Protein Analyzer")
 
 with st.sidebar:
     st.header("⚙️ Configurações")
