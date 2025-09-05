@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Ambientes / IDE
+.venv/
+.env
+.idea/
+.vscode/
+
+# Streamlit
+.streamlit/
+
+# Artefatos do app
+runs/
+*.zip
+
+# Logs comuns
+*.log

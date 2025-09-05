@@ -1,1496 +1,1521 @@
-from __future__ import annotations
-from io import StringIO
-from Bio import SeqIO
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-# ==============================
-# CONFIG — ÚNICO PONTO DE AJUSTE
-# ==============================
-CONFIG = {
+"""
+Effatha — Gene & Protein Analyzer (com regiões funcionais em todas as entradas)
+- Normaliza qualquer entrada (UniProt, PDB, NCBI Protein, NCBI Gene) para um alvo UniProt
+- Extrai features reais do UniProt como regiões/sítios (com flancos configuráveis)
+- Mapeia CDS real (GenBank/nuccore) sem retrotradução (por /protein_id ou /translation)
+- BLASTp/BLASTn por região → sintaxe Effatha [A/L/E] (AA) e [A/C/G/T] (NT)
+- Saídas: runs/report.txt, runs/regions.csv, runs/context_summary.json (+ opcional variants_blast.csv)
+
+Requisitos:
+  pip install biopython requests
+  export NCBI_EMAIL="seu_email@dominio"
+  export NCBI_API_KEY="sua_chave"   # opcional, mas recomendado
+"""
+
+from __future__ import annotations
+
+import os, io, re, csv, json, time
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional, Any
+
+import requests
+from Bio import Entrez, SeqIO
+from Bio.Seq import Seq
+from Bio.Blast import NCBIWWW, NCBIXML
+
+# =========================
+# Config
+# =========================
+CONFIG: Dict[str, Any] = {
     "input": {
-        # "pdb" | "uniprot" | "ncbi_protein" | "ncbi_gene"
-        "source": "ncbi_protein",
-        "pdb_id": "5xnl",
-        "uniprot_acc": "O14744",
+        "source": "ncbi_protein",  # "uniprot" | "pdb" | "ncbi_protein" | "ncbi_gene"
+        "uniprot_acc": "P00533",
+        "pdb_id": "5XNL",
         "ncbi_protein_acc": "AML61188.1",
         "gene": {
-            "id_type": "entrez",      # "entrez" | "symbol"
-            "id": "7157",             # GeneID se id_type=="entrez"
-            "symbol": "TP53",         # símbolo se id_type=="symbol"
-            "taxid": 9606,            # obrigatório p/ symbol
-            "isoform_policy": "longest"  # "longest" | "mane" | "all"
+            "id_type": "entrez",  # "entrez" | "symbol"
+            "id": "1956",             # ex.: "7157"
+            "symbol": "",         # ex.: "TP53"
+            "taxid": 9606,
+            "isoform_policy": "longest",  # usado apenas para entrada "ncbi_gene"
         },
     },
 
+    # Regiões/sítios funcionais (a partir de features reais do UniProt)
     "regions": {
-        "mode": "uniprot_features",      # "uniprot_features" | "pfam" | "both"
-        "feature_types": "ALL",
-        "flank_left": 5,
-        "flank_right": 5,
-        "merge_overlaps": True,
-        # incluir features NCBI (GenPept) quando houver RefSeq associado
-        "include_ncbi_protein_features": True,
-    },
-
-    "windows": {
-        "flank_scan": 5,
-        "stride": 10
+        "use_uniprot_features": True,
+        "include_feature_types": [
+            "domain","region","region of interest","repeat","coiled coil","zinc finger","motif","compositional bias",
+            "transmembrane","topological domain","intramembrane",
+            "active site","site","binding site","metal binding","calcium binding","dna binding","nucleotide binding",
+            "signal peptide","transit peptide","propeptide","peptide","chain","initiator methionine",
+            "glycosylation site","lipidation","modified residue","disulfide bond","cross-link",
+            "natural variant","mutagenesis","sequence conflict","non-standard residue","non-terminal residue","non-adjacent residues",
+            "helix","beta strand","turn"
+        ],
+        "point_flank": 5,         # flancos SOMENTE em features pontuais (±5 aa)
+        "default_min_len": 6,     # descarta regiões curtas após aplicar flancos
+        "merge_overlaps": True,   # mesclar sobreposições do MESMO tipo
+        "add_full": True,         # adiciona FULL (1..len)
+        # NOVO: se o UniProt vier vazio (ou só FULL), tenta features do GenPept automaticamente
+        "fallback_genpept_if_uniprot_featureless": True
     },
 
     "blast": {
-        "enable": True,
-        "database": "nr",
-        "expect": 1e-5,
-        "hitlist_size": 10,
-        "throttle_seconds": 11,
-        "min_pct_identity": 90.0,
-        "min_query_coverage": 0.95,
-        "same_species_only": True
+        "enable": True,  # liga/desliga BLAST (AA + NT)
+
+        # ===== Controles de espécie/preview =====
+        "same_species_only": True,         # aplica filtro de mesma espécie em AA e NT (via taxid)
+        "log_offspecies_preview": False,   # roda um preview sem filtro (somente LOG; não entra nos colchetes)
+
+        # ===== Preset para MÁXIMO de colchetes no MESMO organismo =====
+        "protein": {
+            # roda em múltiplos bancos e une as variações (mesmo organismo via entrez_query)
+            "dbs": ["refseq_protein", "nr"],
+            # "db" single é mantido como fallback (não usado quando "dbs" presente)
+            "db": "refseq_protein",
+
+            "hitlist_size": 200,
+            "expect": 1e-5,
+
+            # thresholds permissivos para capturar isoformas/variantes intra-espécie
+            "min_identity": 0.85,          # proporção
+            "min_query_coverage": 0.90,
+
+            # será setado dinamicamente quando tivermos taxid (ex.: "txid9606[ORGN]")
+            "entrez_query": None,
+        },
+        "nt": {
+            "dna_db": "nt",           # DNA
+            "rna_db": "refseq_rna",   # mRNA
+            "hitlist_size": 25,
+            "expect": 1e-10,
+            "min_identity": 0.98,
+            "min_query_coverage": 0.95,
+            "megablast": True,
+            # NOVO: filtro por espécie também no NT
+            "entrez_query": None
+        }
     },
+
+    "cds_mapping": {"enable": True},
 
     "output": {
+        "artifacts_dir": "runs",
+        "report_txt": "runs/report.txt",
+        "export_regions_csv": "runs/regions.csv",
+        "export_csv": None,  # "runs/variants_blast.csv"
         "blast_progress": True,
-        "export_csv": None,
-        "report_txt": "run_report.txt",
-        "export_regions_csv": None,
-        "artifacts_dir": ".",
+
+        # ===== Auditoria de BLAST =====
+        "log_hits": True,                           # imprime hits aceitos no console
+        "blast_hits_csv": "runs/blast_hits.csv",    # salva auditoria de hits em CSV
     },
 
-    "cds_mapping": {
-        "enable": True
-    },
-
-    "external_layers": {
-        "uniprot_variant": {"enable": True},
-        "variation_api": {"enable": True},
-    },
-
-    "variation_filters": {
-        "enabled": True,
-        "min_af": 0.01,
-        "clinical": {
-            "allow": ["benign","likely_benign"],
-            "allow_if_conflicting": False,
-            "allow_uncertain": False,
-        },
-        "evidence": {
-            "assertion": "prefer_manual",
-            "treat_missing_as": "include",
-        },
-        "predictions": {
-            "sift_allow": ["tolerated","tolerated_low_confidence"],
-            "polyphen_allow": ["benign","possibly_benign"],
-            "require_both": False,
-        },
-        "include_blast_in_filtered": True,
-    },
-
-    "net": {
-        "user_agent": "Effatha-RnD/1.0 (contact: lovato.rodrigo@gmail.com)",
-        "timeout_connect": 10,
-        "timeout_read": 30,
-        "ncbi_api_key_env": "NCBI_API_KEY",
-        "eutils_email_env": "EUTILS_EMAIL"
-    },
+    # (opcional) alternativa para setar credenciais aqui em vez de ENV:
+    "ncbi": {
+        # "email": "seu_email@dominio",
+        # "api_key": "sua_chave_aqui"
+    }
 }
-# ==============================
-# FIM DO BLOCO CONFIG
-# ==============================
 
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple, Iterable, Set
-import argparse
-import os
-import time
-import logging
-import csv
-import json
-from datetime import datetime
+# =========================
+# NCBI / HTTP
+# =========================
+NCBI_EMAIL   = os.getenv("NCBI_EMAIL", "").strip()
+NCBI_API_KEY = os.getenv("NCBI_API_KEY", "").strip()
+NCBI_EMAIL   = CONFIG.get("ncbi", {}).get("email", NCBI_EMAIL).strip()
+NCBI_API_KEY = CONFIG.get("ncbi", {}).get("api_key", NCBI_API_KEY).strip()
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from Bio.Blast import NCBIWWW, NCBIXML
-from Bio import SeqIO
-from io import StringIO
-import xml.etree.ElementTree as ET
+if NCBI_EMAIL:
+    Entrez.email = NCBI_EMAIL
+if NCBI_API_KEY:
+    Entrez.api_key = NCBI_API_KEY
 
-# ----------------------------------------------------------------------------
-# Lista completa de feature types da UniProt (atual)
-# ----------------------------------------------------------------------------
-ALL_UNIPROT_FEATURE_TYPES = [
-    "ACT_SITE","BINDING","CARBOHYD","CHAIN","COILED","COMPBIAS","CONFLICT","CROSSLNK",
-    "DNA_BIND","DISULFID","DOMAIN","HELIX","INIT_MET","INTRAMEM","LIPID","MOD_RES",
-    "MOTIF","MUTAGEN","NON_CONS","NON_STD","NON_TER","PEPTIDE","PROPEP","REGION",
-    "REPEAT","SIGNAL","SITE","STRAND","TOPO_DOM","TRANSIT","TRANSMEM","TURN",
-    "VARIANT","VAR_SEQ",
-]
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Effatha-GPA/3.0 (+https://effatha)"})
 
-def _resolve_feature_types(cfg_value):
-    if isinstance(cfg_value, str) and cfg_value.upper() == "ALL":
-        return ALL_UNIPROT_FEATURE_TYPES
-    if isinstance(cfg_value, (list, tuple)):
-        return [str(t).upper() for t in cfg_value]
-    return ALL_UNIPROT_FEATURE_TYPES
 
-# ----------------------------------------------------------------------------
-# Config efetiva a partir de CONFIG
-# ----------------------------------------------------------------------------
-USER_AGENT = CONFIG["net"]["user_agent"]
-DEFAULT_TIMEOUT = (CONFIG["net"]["timeout_connect"], CONFIG["net"]["timeout_read"])
+def _http_retry(method: str, url: str, **kwargs):
+    """GET/POST com backoff (429/5xx)."""
+    max_tries = kwargs.pop("max_tries", 6)
+    backoff = 1.5
+    for i in range(max_tries):
+        try:
+            resp = SESSION.request(method, url, timeout=45, **kwargs)
+            if resp.status_code in (429, 500, 502, 503, 504):
+                raise requests.HTTPError(f"{resp.status_code} transient", response=resp)
+            resp.raise_for_status()
+            return resp
+        except requests.HTTPError:
+            if i == max_tries - 1:
+                raise
+            time.sleep((backoff ** i) + (0.1 * i))
+        except requests.RequestException:
+            if i == max_tries - 1:
+                raise
+            time.sleep((backoff ** i) + (0.1 * i))
+    raise RuntimeError("HTTP retry failed")
 
-BLAST_DB = CONFIG["blast"]["database"]
-BLAST_PROGRAM = "blastp"
-BLAST_EXPECT = CONFIG["blast"]["expect"]
-BLAST_MAX_ALIGNMENTS = CONFIG["blast"]["hitlist_size"]
-BLAST_THROTTLE_SECONDS = CONFIG["blast"]["throttle_seconds"]
-MIN_PCT_IDENTITY = CONFIG["blast"]["min_pct_identity"]
-MIN_QUERY_COVERAGE = CONFIG["blast"]["min_query_coverage"]
-SAME_SPECIES_ONLY = CONFIG["blast"]["same_species_only"]
-
-INTERPRO_PFAM_FOR_PROT = "https://www.ebi.ac.uk/interpro/api/entry/pfam/protein/uniprot/{acc}?format=json"
-PDBe_UNIPROT_MAP = "https://www.ebi.ac.uk/pdbe/api/mappings/uniprot/{pdb_id}"
-UNIPROT_FASTA_URL = "https://rest.uniprot.org/uniprotkb/{acc}.fasta"
-UNIPROT_ENTRY_JSON = "https://rest.uniprot.org/uniprotkb/{acc}.json"
-UNIPROT_SEARCH_URL = "https://rest.uniprot.org/uniprotkb/search"
-UNIPROT_IDMAP_RUN = "https://rest.uniprot.org/idmapping/run"
-UNIPROT_IDMAP_STATUS = "https://rest.uniprot.org/idmapping/status/{job}"
-
-EUTILS_EFETCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-EUTILS_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-EUTILS_ELINK  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi"
-EUTILS_ESUMMARY = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
-
-NCBI_API_KEY = os.getenv(CONFIG["net"]["ncbi_api_key_env"])
-EUTILS_TOOL = "Effatha-RnD"
-EUTILS_EMAIL = os.getenv(CONFIG["net"]["eutils_email_env"]) or "lovato.rodrigo@gmail.com"
-
-# ----------------------------------------------------------------------------
-# Sessão HTTP com retries
-# ----------------------------------------------------------------------------
-def make_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
-    r = Retry(total=5, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504))
-    s.mount("https://", HTTPAdapter(max_retries=r))
-    s.mount("http://", HTTPAdapter(max_retries=r))
-    return s
-
-SESSION = make_session()
-
-# ----------------------------------------------------------------------------
-# Models
-# ----------------------------------------------------------------------------
-@dataclass
-class PfamDomain:
-    accession: str
-    start_1based: int
-    end_1based: int
-    description: str = ""
-
+# =========================
+# Estruturas
+# =========================
 @dataclass
 class Region:
     start_1based: int
     end_1based: int
-    source: str             # "UNIPROT_FEATURE", "PFAM", "NCBI_FEATURE"
-    type: str               # feature type (ex.: BINDING, ACT_SITE...) ou Pfam ACC
+    tag: str
     note: str = ""
 
+    @property
+    def length(self) -> int:
+        return self.end_1based - self.start_1based + 1
+
+
 @dataclass
-class Mapping:
-    pdb_id: str
-    chain: str
+class PDBUniProtMap:
     uniprot_acc: str
-    unp_start: int
-    unp_end: int
-    coverage: float
+    chain: str
+    coverage: float     # 0..1
 
-@dataclass
-class Window:
-    abs_center_pos_1based: int
-    seq: str
-    start_in_protein_1based: int
-    center_index_in_window_0based: int
-    region_source: Optional[str] = None
-    region_type: Optional[str] = None
-    region_note: Optional[str] = ""
+# =========================
+# Auditoria de BLAST (logs/CSV) + alvo esperado
+# =========================
+_BLASTP_AUDIT: List[Dict[str, Any]] = []
+_BLASTN_AUDIT: List[Dict[str, Any]] = []
 
-@dataclass
-class Variant:
-    abs_pos_1based: int
-    ref: str
-    alt: str
-    subject_title: str
+_EXPECTED_TAXID: Optional[int] = None
+_EXPECTED_SPECIES: Optional[str] = None
 
-# ----------------------------------------------------------------------------
-# Globals de mapeamento (para inserir no relatório)
-# ----------------------------------------------------------------------------
-MAPPING_INFO: Optional[Dict] = None
+def _species_from_def(s: str) -> str:
+    m = re.search(r"\[([^\[\]]+)\]\s*$", s or "")
+    return m.group(1) if m else ""
 
-# ----------------------------------------------------------------------------
-# UniProt / InterPro / PDBe utilitários
-# ----------------------------------------------------------------------------
-def fetch_uniprot_fasta(accession: str) -> str:
-    r = SESSION.get(UNIPROT_FASTA_URL.format(acc=accession), timeout=DEFAULT_TIMEOUT)
-    r.raise_for_status()
-    lines = [ln.strip() for ln in r.text.splitlines() if ln and not ln.startswith(">")]
-    return "".join(lines)
+def _audit_hit(kind: str, db: str, region_tag: str, accession: str,
+               hit_def: str, pid: float, cov: float, hsp_query_len: int):
+    """
+    kind: "protein" ou "nucleotide"
+    pid, cov: 0..1
+    - extrai espécie do defline (quando presente no padrão "... [Species]")
+    - marca same_species se coincidir com o alvo atual (quando conhecido)
+    """
+    hit_species = _species_from_def(hit_def)
+    same_species = None
+    if _EXPECTED_SPECIES:
+        same_species = (hit_species == _EXPECTED_SPECIES)
 
-def fetch_uniprot_meta(accession: str) -> Dict:
-    r = SESSION.get(UNIPROT_ENTRY_JSON.format(acc=accession), timeout=DEFAULT_TIMEOUT)
-    r.raise_for_status()
+    rec = {
+        "kind": kind,
+        "db": db,
+        "region": region_tag,
+        "accession": accession,
+        "percent_identity": round(pid * 100.0, 1),
+        "query_coverage": round(cov * 100.0, 1),
+        "hsp_query_len": int(hsp_query_len),
+        "definition": (hit_def or "")[:200],
+        "species": hit_species,
+        "same_species": same_species
+    }
+    if kind == "protein":
+        _BLASTP_AUDIT.append(rec)
+    else:
+        _BLASTN_AUDIT.append(rec)
+
+    if CONFIG["output"].get("blast_progress") and CONFIG["output"].get("log_hits", True):
+        ss = "" if same_species is None else (" ✓same" if same_species else " ✗off")
+        print(
+            f"[HIT {'P' if kind=='protein' else 'N'}] "
+            f"db={db} region={region_tag} acc={accession} "
+            f"pid≈{rec['percent_identity']}% cov≈{rec['query_coverage']}% "
+            f"sp='{hit_species}'{ss} "
+            f"def={rec['definition']}"
+        )
+
+# =========================
+# UniProt helpers
+# =========================
+def fetch_uniprot_json(acc_or_iso: str) -> Dict:
+    """Baixa JSON do UniProt (ACC ou ACC-isoform)."""
+    url = f"https://rest.uniprot.org/uniprotkb/{acc_or_iso}.json"
+    r = _http_retry("GET", url)
     return r.json()
 
-def fetch_pdb_uniprot_mappings(pdb_id: str) -> List[Mapping]:
-    url = PDBe_UNIPROT_MAP.format(pdb_id=pdb_id.lower())
-    r = SESSION.get(url, timeout=DEFAULT_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    if not data:
-        return []
-    root = data.get(pdb_id.lower()) or {}
-    uni = root.get("UniProt") or {}
-    mappings: List[Mapping] = []
-    for acc, info in uni.items():
-        for m in info.get("mappings", []):
-            chain = m.get("chain_id") or m.get("chain") or "?"
-            unp_start = int(m.get("unp_start", 1))
-            unp_end = int(m.get("unp_end", unp_start))
-            mappings.append(Mapping(pdb_id=pdb_id, chain=chain, uniprot_acc=acc,
-                                    unp_start=unp_start, unp_end=unp_end, coverage=0.0))
-    return mappings
-
-def choose_best_mapping(maps: List[Mapping], seq_len_by_acc: Dict[str, int], reviewed_by_acc: Dict[str, bool]) -> Mapping:
-    best: Optional[Mapping] = None
-    for m in maps:
-        L = seq_len_by_acc.get(m.uniprot_acc, 1) or 1
-        m.coverage = (m.unp_end - m.unp_start + 1) / float(L)
-        reviewed = reviewed_by_acc.get(m.uniprot_acc, False)
-        if best is None:
-            best = m
-            best._reviewed = reviewed  # type: ignore
-        else:
-            if (m.coverage > best.coverage + 1e-9) or (abs(m.coverage - best.coverage) < 1e-9 and reviewed and not getattr(best, "_reviewed", False)):
-                best = m
-                best._reviewed = reviewed  # type: ignore
-    assert best is not None
-    return best
-
-def fetch_pfam_domains(accession: str) -> List[PfamDomain]:
-    r = SESSION.get(INTERPRO_PFAM_FOR_PROT.format(acc=accession), headers={"Accept": "application/json"}, timeout=DEFAULT_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    out: List[PfamDomain] = []
-    for entry in data.get("results", []):
-        meta = entry.get("metadata", {})
-        pf = meta.get("accession", "")
-        desc = meta.get("name", "") or ""
-        loc_blocks = []
-        if isinstance(entry.get("entry_protein_locations"), list):
-            loc_blocks = entry["entry_protein_locations"]
-        else:
-            for p in entry.get("proteins", []) or []:
-                loc_blocks.extend(p.get("entry_protein_locations", []) or [])
-        for loc in loc_blocks:
-            for frag in loc.get("fragments", []) or []:
-                try:
-                    s = int(frag.get("start", 0)); e = int(frag.get("end", 0))
-                except Exception:
-                    continue
-                if s > 0 and e >= s:
-                    out.append(PfamDomain(pf, s, e, desc))
-    return out
-
-# --- UniProt FEATURES (regiões funcionais) ---
-def fetch_uniprot_functional_regions(meta: Dict, wanted_types: List[str]) -> List[Region]:
-    regions: List[Region] = []
-    feats = meta.get("features", []) or []
-    for ft in feats:
-        ftype = (ft.get("type") or "").upper()
-        if ftype not in wanted_types:
-            continue
-        loc = ft.get("location") or {}
-        start = None; end = None
-        if "start" in loc and "end" in loc and loc.get("start") and loc.get("end"):
-            start = int(loc["start"].get("value", 0)); end = int(loc["end"].get("value", 0))
-        elif "position" in loc and loc.get("position"):
-            start = end = int(loc["position"].get("value", 0))
-        if not start or not end or end < start:
-            continue
-        notes = []
-        desc = ft.get("description")
-        if desc:
-            notes.append(str(desc))
-        lig = ft.get("ligand") or {}
-        if isinstance(lig, dict) and (lig.get("name") or lig.get("id") or lig.get("label")):
-            name = lig.get("name") or lig.get("label") or "ligand"
-            chebi = lig.get("id") or lig.get("databaseId")
-            if chebi:
-                notes.append(f"ligand={name} ({chebi})")
-            else:
-                notes.append(f"ligand={name}")
-        ligpart = ft.get("ligandPart") or {}
-        if isinstance(ligpart, dict) and (ligpart.get("name") or ligpart.get("id")):
-            name = ligpart.get("name") or ligpart.get("label") or "part"
-            chebi = ligpart.get("id") or ligpart.get("databaseId")
-            if chebi:
-                notes.append(f"ligandPart={name} ({chebi})")
-            else:
-                notes.append(f"ligandPart={name}")
-        note = "; ".join(notes)
-        regions.append(Region(start, end, "UNIPROT_FEATURE", ftype, note))
-    return regions
-
-# ----------------------------------------------------------------------------
-# NCBI & UniProt mapping helpers
-# ----------------------------------------------------------------------------
-def _eutils_params(base: Dict[str, str]) -> Dict[str, str]:
-    p = dict(base)
-    p["tool"] = EUTILS_TOOL
-    p["email"] = EUTILS_EMAIL
-    if NCBI_API_KEY:
-        p["api_key"] = NCBI_API_KEY
-    return p
-
-def _strip_refseq_version(acc: str) -> str:
-    # NP_000537.3 -> NP_000537
-    if "." in acc:
-        return acc.split(".", 1)[0]
-    return acc
-
-def _uniprot_idmap_refseq_to_uniprot(acc_list: List[str]) -> Dict[str, str]:
+def fetch_uniprot_fasta(acc: str, include_isoforms: bool=False) -> Dict[str, str]:
     """
-    Usa UniProt ID Mapping (jobs) para mapear RefSeq_Protein -> UniProtKB.
-    Retorna dict {input_id: uniprot_acc} (primeiro resultado para cada).
+    Retorna dict {uniprot_id(ACC ou ACC-isoform): sequence} .
+    Se include_isoforms=True, baixa também isoformas.
     """
-    if not acc_list:
-        return {}
-    try:
-        data = {
-            "from": "RefSeq_Protein",
-            "to": "UniProtKB",
-            "ids": ",".join(acc_list),
-        }
-        r = SESSION.post(UNIPROT_IDMAP_RUN, data=data, timeout=DEFAULT_TIMEOUT)
-        if r.status_code != 200:
-            return {}
-        job = r.json().get("jobId")
-        if not job:
-            return {}
-        # polling
-        for _ in range(30):
-            time.sleep(1.0)
-            rs = SESSION.get(UNIPROT_IDMAP_STATUS.format(job=job), timeout=DEFAULT_TIMEOUT)
-            if rs.status_code != 200:
-                continue
-            js = rs.json()
-            if js.get("jobStatus") == "RUNNING":
-                continue
-            # resultados inline
-            results = (js.get("results") or [])
-            out: Dict[str,str] = {}
-            for row in results:
-                frm = row.get("from")
-                to = row.get("to")
-                if frm and to and frm not in out:
-                    out[frm] = to.split("-", 1)[0]  # garante ACC (sem isoform suffix)
-            # também tentar "redirectURL" (algumas versões da API retornam links)
-            # mas manteremos simples aqui.
-            return out
-    except Exception:
-        return {}
-    return {}
-
-def map_refseq_protein_to_uniprot(refseq_acc: str) -> Optional[str]:
-    """
-    Estratégia robusta:
-      1) UniProt search xref:RefSeq:<acc_versionless>
-      2) UniProt search xref:RefSeq:<acc_full>
-      3) ID mapping API (com e sem versão)
-    """
-    candidates: List[str] = []
-    for qacc in [_strip_refseq_version(refseq_acc), refseq_acc]:
-        try:
-            q = f"xref:RefSeq:{qacc}"
-            params = {"query": q, "fields": "accession,reviewed", "format": "json", "size": 10}
-            r = SESSION.get(UNIPROT_SEARCH_URL, params=params, timeout=DEFAULT_TIMEOUT)
-            if r.status_code == 200:
-                data = r.json()
-                results = data.get("results") or []
-                for x in results:
-                    acc = x.get("primaryAccession")
-                    if acc:
-                        candidates.append((acc, (x.get("entryType","").lower()=="reviewed")))
-        except Exception:
-            pass
-        if candidates:
-            break
-
-    if not candidates:
-        # tenta ID mapping (com e sem versão)
-        mp = _uniprot_idmap_refseq_to_uniprot([_strip_refseq_version(refseq_acc), refseq_acc])
-        # prioriza mapa do sem versão
-        for key in [_strip_refseq_version(refseq_acc), refseq_acc]:
-            if key in mp:
-                return mp[key]
-        # se veio só algum outro, pega o primeiro
-        if mp:
-            return list(mp.values())[0]
-        return None
-
-    # prefere reviewed
-    reviewed = [acc for acc,rev in candidates if rev]
-    return reviewed[0] if reviewed else candidates[0][0]
-
-# ----------------------------------------------------------------------------
-# NCBI: features de proteína (GenPept) e utilitários gene/protein
-# ----------------------------------------------------------------------------
-def fetch_ncbi_protein_gb_text(acc: str) -> Optional[str]:
-    params = _eutils_params({"db": "protein", "id": acc, "rettype": "gp", "retmode": "text"})
-    r = SESSION.get(EUTILS_EFETCH, params=params, timeout=DEFAULT_TIMEOUT)
-    if r.status_code != 200 or not r.text.strip():
-        return None
-    return r.text
-
-def fetch_ncbi_protein_features_to_regions(acc: str) -> List[Region]:
-    text = fetch_ncbi_protein_gb_text(acc)
-    if not text:
-        return []
-    try:
-        rec = SeqIO.read(StringIO(text), "gb")
-    except Exception:
-        return []
-    L = len(rec.seq or "")
-    regions: List[Region] = []
-    for feat in rec.features or []:
-        ftype = (feat.type or "").lower()
-        try:
-            start = int(feat.location.start) + 1
-            end = int(feat.location.end)
-            if start < 1 or end < start or end > L:
-                continue
-        except Exception:
-            continue
-
-        q = feat.qualifiers or {}
-        note_parts: List[str] = []
-        if ftype == "site":
-            stype = (q.get("site_type",[None])[0] or "").lower()
-            if "active" in stype:
-                rtype = "ACT_SITE"
-            elif "metal" in stype:
-                rtype = "BINDING"
-                nm = q.get("note",[None])[0]
-                if nm:
-                    note_parts.append(f"metal={nm}")
-            elif "binding" in stype:
-                rtype = "BINDING"
-            elif "glycosylation" in stype:
-                rtype = "CARBOHYD"
-            elif "modified" in stype:
-                rtype = "MOD_RES"
-            else:
-                rtype = "SITE"
-            if q.get("note"):
-                note_parts.append(q["note"][0])
-            regions.append(Region(start, end, "NCBI_FEATURE", rtype, "; ".join(note_parts)))
-        elif ftype == "bond" or ftype == "disulfide bond":
-            rtype = "DISULFID"
-            if q.get("note"):
-                note_parts.append(q["note"][0])
-            regions.append(Region(start, end, "NCBI_FEATURE", rtype, "; ".join(note_parts)))
-        elif ftype in ("sig_peptide","signal peptide"):
-            regions.append(Region(start, end, "NCBI_FEATURE", "SIGNAL", "; ".join(q.get("note",[]))))
-        elif ftype in ("transit_peptide",):
-            regions.append(Region(start, end, "NCBI_FEATURE", "TRANSIT", "; ".join(q.get("note",[]))))
-        elif ftype in ("mat_peptide",):
-            regions.append(Region(start, end, "NCBI_FEATURE", "PEPTIDE", "; ".join(q.get("product",[]))))
-        elif ftype in ("propeptide",):
-            regions.append(Region(start, end, "NCBI_FEATURE", "PROPEP", "; ".join(q.get("note",[]))))
-        elif ftype == "region":
-            rname = (q.get("region_name",[None])[0] or q.get("note",[None])[0] or "").lower()
-            rtype = "REGION"
-            if "zinc finger" in rname:
-                rtype = "DOMAIN"; note_parts.append("zinc finger")
-            elif "coiled-coil" in rname or "coiled coil" in rname:
-                rtype = "COILED"
-            elif "transmembrane" in rname:
-                rtype = "TRANSMEM"
-            elif "dna-binding" in rname or "dna binding" in rname:
-                rtype = "DNA_BIND"
-            elif "domain" in rname:
-                rtype = "DOMAIN"
-            if rname:
-                note_parts.append(rname)
-            regions.append(Region(start, end, "NCBI_FEATURE", rtype, "; ".join(note_parts)))
-        elif ftype == "conflict":
-            regions.append(Region(start, end, "NCBI_FEATURE", "CONFLICT", "; ".join(q.get("note",[]))))
-        elif ftype == "variant":
-            regions.append(Region(start, end, "NCBI_FEATURE", "VARIANT", "; ".join(q.get("note",[]))))
-        else:
-            pass
-    return regions
-
-def ncbi_gene_to_refseq_proteins_by_geneid(gene_id: str) -> List[Tuple[str,int]]:
-    params = _eutils_params({"dbfrom":"gene","db":"protein","linkname":"gene_protein_refseq","id":gene_id})
-    r = SESSION.get(EUTILS_ELINK, params=params, timeout=DEFAULT_TIMEOUT)
-    if r.status_code != 200:
-        return []
-    try:
-        root = ET.fromstring(r.text)
-        ids = [e.text for e in root.findall(".//LinkSetDb/Link/Id") if e.text]
-    except Exception:
-        ids = []
-    if not ids:
-        return []
-    params = _eutils_params({"db":"protein","id":",".join(ids)})
-    r2 = SESSION.get(EUTILS_ESUMMARY, params=params, timeout=DEFAULT_TIMEOUT)
-    if r2.status_code != 200:
-        return []
-    try:
-        root2 = ET.fromstring(r2.text)
-        out: List[Tuple[str,int]] = []
-        for doc in root2.findall(".//DocSum"):
-            acc = None; length = None
-            for itm in doc.findall("Item"):
-                if itm.get("Name") == "AccessionVersion":
-                    acc = itm.text
-                if itm.get("Name") == "Length":
-                    try:
-                        length = int(itm.text or "0")
-                    except Exception:
-                        length = None
-            if acc and length:
-                out.append((acc, length))
-        return out
-    except Exception:
-        return []
-
-def ncbi_symbol_to_geneid(symbol: str, taxid: int) -> Optional[str]:
-    q = f"{symbol}[Symbol]+AND+{taxid}[TaxID]"
-    params = _eutils_params({"db":"gene","term":q,"retmax":"1"})
-    r = SESSION.get(EUTILS_ESEARCH, params=params, timeout=DEFAULT_TIMEOUT)
-    if r.status_code != 200:
-        return None
-    try:
-        root = ET.fromstring(r.text)
-        gid = root.findtext(".//IdList/Id")
-        return gid
-    except Exception:
-        return None
-
-def choose_isoform(refseqs: List[Tuple[str,int]], policy: str = "longest") -> Optional[str]:
-    if not refseqs:
-        return None
-    np = [x for x in refseqs if x[0].startswith("NP_")]
-    xp = [x for x in refseqs if x[0].startswith("XP_")]
-    group = np if np else xp
-    group.sort(key=lambda z: z[1], reverse=True)
-    return group[0][0]
-
-# ----------------------------------------------------------------------------
-# Regiões → janelas
-# ----------------------------------------------------------------------------
-def expand_regions(regs: List[Region], L: int, flank_left: int, flank_right: int, merge: bool) -> List[Region]:
-    expanded: List[Region] = []
-    for r in regs:
-        s = max(1, r.start_1based - flank_left)
-        e = min(L, r.end_1based + flank_right)
-        expanded.append(Region(s, e, r.source, r.type, r.note))
-    if not merge or not expanded:
-        return expanded
-    expanded.sort(key=lambda x: (x.start_1based, x.end_1based))
-    merged: List[Region] = [expanded[0]]
-    for r in expanded[1:]:
-        last = merged[-1]
-        if r.start_1based <= last.end_1based + 1 and r.source == last.source and r.type == last.type:
-            merged[-1] = Region(last.start_1based, max(last.end_1based, r.end_1based), last.source, last.type, last.note)
-        else:
-            merged.append(r)
-    return merged
-
-def regions_to_windows(sequence: str, regs: List[Region]) -> List[Window]:
-    out: List[Window] = []
-    for r in regs:
-        left = r.start_1based; right = r.end_1based
-        subseq = sequence[left - 1: right]
-        center0 = (right - left) // 2
-        abs_center = left + center0
-        out.append(Window(abs_center, subseq, left, center0, r.source, r.type, r.note))
-    return out
-
-def make_windows_pfam_mode(sequence: str, domains: List[PfamDomain], flank: int, stride: int) -> List[Window]:
-    L = len(sequence)
-    win_len = 2 * flank + 1
-    windows: List[Window] = []
-    for d in domains:
-        start, end = d.start_1based, d.end_1based
-        pos = start
-        while pos <= end:
-            left = max(1, pos - flank); right = min(L, pos + flank)
-            if right - left + 1 < win_len:
-                if left == 1: right = min(L, left + win_len - 1)
-                elif right == L: left = max(1, right - win_len + 1)
-            subseq = sequence[left - 1: right]
-            center0 = pos - left
-            windows.append(Window(pos, subseq, left, center0, "PFAM", d.accession, d.description))
-            pos += stride
-    return windows
-
-# ----------------------------------------------------------------------------
-# BLAST
-# ----------------------------------------------------------------------------
-def qblast_window(
-    win: Window,
-    *,
-    entrez_query: Optional[str],
-    min_pct_identity: float,
-    min_query_cov: float,
-    organism_filter_name: Optional[str] = None,
-    hsp_log: bool = False,
-) -> List[Variant]:
-    kwargs = {
-        "program": "blastp",
-        "database": BLAST_DB,
-        "sequence": win.seq,
-        "expect": BLAST_EXPECT,
-        "hitlist_size": BLAST_MAX_ALIGNMENTS,
-        "format_type": "XML",
-    }
-    if entrez_query:
-        kwargs["entrez_query"] = entrez_query
-    if NCBI_API_KEY:
-        kwargs["ncbi_api_key"] = NCBI_API_KEY
-
-    try:
-        handle = NCBIWWW.qblast(**kwargs)
-    except ValueError as e:
-        if "Entrez Query" in str(e):
-            kwargs.pop("entrez_query", None)
-            handle = NCBIWWW.qblast(**kwargs)
-        else:
-            raise
-
-    vars_out: List[Variant] = []
-    for rec in NCBIXML.parse(handle):
-        for aln in rec.alignments:
-            title = getattr(aln, "title", "")
-            if organism_filter_name and organism_filter_name.lower() not in title.lower():
-                if hsp_log:
-                    print(f"[SKIP-ORG] {title}")
-                continue
-            for hsp in aln.hsps:
-                q_seq = hsp.query or ""
-                s_seq = hsp.sbjct or ""
-                q_non_gap = sum(1 for c in q_seq if c != "-")
-                cov = q_non_gap / max(1, len(win.seq))
-                try:
-                    pct_id = 100.0 * (hsp.identities / float(hsp.align_length))
-                except Exception:
-                    pct_id = 0.0
-                if cov < min_query_cov or pct_id < min_pct_identity:
-                    if hsp_log:
-                        print(f"[SKIP] cov={cov:.2f} id={pct_id:.1f}% title={title}")
-                    continue
-                if hsp_log:
-                    print(f"[PASS] cov={cov:.2f} id={pct_id:.1f}% title={title}")
-                idx = 0
-                for cq, cs in zip(q_seq, s_seq):
-                    if cq != "-":
-                        abs_pos = win.start_in_protein_1based + idx
-                        if cq != cs and cs != "-":
-                            vars_out.append(Variant(abs_pos, cq, cs, title))
-                        idx += 1
-    return vars_out
-
-def qblast_many(
-    windows: List[Window],
-    *,
-    entrez_query: Optional[str],
-    min_pct_identity: float,
-    min_query_cov: float,
-    organism_filter_name: Optional[str] = None,
-    hsp_log: bool = False,
-    sleep_s: float = BLAST_THROTTLE_SECONDS,
-    progress: bool = False,
-) -> List[Variant]:
-    out: List[Variant] = []
-    total = len(windows)
-    if progress:
-        print(f"[BLAST] Rodando {total} janelas…")
-    for i, w in enumerate(windows, 1):
-        if progress:
-            tag = (w.region_source or "?") + ":" + (w.region_type or "?")
-            print(f"  - {i}/{total} pos={w.abs_center_pos_1based} {tag}")
-        out.extend(
-            qblast_window(
-                w,
-                entrez_query=entrez_query,
-                min_pct_identity=min_pct_identity,
-                min_query_cov=min_query_cov,
-                organism_filter_name=organism_filter_name,
-                hsp_log=hsp_log,
-            )
-        )
-        if i < total:
-            time.sleep(sleep_s)
-    return out
-
-# ----------------------------------------------------------------------------
-# Agregação / Colchetes / CSV
-# ----------------------------------------------------------------------------
-def variants_by_position(vars: Iterable[Variant]) -> Dict[int, Set[str]]:
-    agg: Dict[int, Set[str]] = {}
-    for v in vars:
-        s = agg.setdefault(v.abs_pos_1based, set())
-        s.add(v.ref); s.add(v.alt)
-    return agg
-
-def aa_regions_bracketed(sequence: str, regs: List[Region], agg: Dict[int, Set[str]]):
-    out = []
-    for r in regs:
-        chars = []
-        for pos in range(r.start_1based, r.end_1based + 1):
-            ref = sequence[pos - 1]
-            opts = agg.get(pos, set()) or set()
-            alts = sorted([a for a in opts if a not in ('-', ref)])
-            if alts:
-                chars.append('[' + '/'.join([ref] + alts) + ']')
-            else:
-                chars.append(ref)
-        tag = f"{r.source}:{r.type}"
-        out.append({"tag": tag, "start": r.start_1based, "end": r.end_1based, "aa": ''.join(chars)})
-    return out
-
-def export_variants_csv(vars: List[Variant], path: str) -> None:
-    tmp: Dict[int, Dict[str, Set[str]]] = {}
-    for v in vars:
-        b = tmp.setdefault(v.abs_pos_1based, {"ref": v.ref, "alts": set()})
-        if v.alt != v.ref:
-            b["alts"].add(v.alt)
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        w.writerow(["abs_pos", "ref", "alts"])
-        for pos in sorted(tmp):
-            w.writerow([pos, tmp[pos]["ref"], "/".join(sorted(tmp[pos]["alts"]))])
-    print(f"CSV exportado: {path}")
-
-# ----------------------------------------------------------------------------
-# DNA/mRNA helpers (NCBI E-utilities) + retrotradução
-# ----------------------------------------------------------------------------
-def extract_nuccore_ids_from_uniprot_meta(meta: Dict) -> List[str]:
-    ids: List[str] = []
-    for x in meta.get("uniProtKBCrossReferences", []) or []:
-        db = x.get("database")
-        if db in ("EMBL", "RefSeq"):
-            acc = x.get("id")
-            if acc and acc not in ids:
-                ids.append(acc)
-    return ids
-
-def _parse_fasta_multi(text: str) -> List[Tuple[str, str]]:
-    seqs: List[Tuple[str, str]] = []
-    header: Optional[str] = None
-    buf: List[str] = []
-    for ln in text.splitlines():
+    url = f"https://rest.uniprot.org/uniprotkb/{acc}.fasta"
+    if include_isoforms:
+        url += "?includeIsoform=true"
+    r = _http_retry("GET", url)
+    out: Dict[str, str] = {}
+    cur_id = None
+    buf = []
+    for ln in r.text.splitlines():
         if ln.startswith(">"):
-            if header is not None:
-                seq = "".join(buf).replace(" ", "").replace("\r", "")
-                seqs.append((header, seq))
-            header = ln[1:].strip()
+            if cur_id and buf:
+                out[cur_id] = "".join(buf).strip()
+            hdr = ln[1:].strip()
+            # headers típicos: sp|P04637|TP53_HUMAN ...  ou sp|P04637-2|TP53_HUMAN Isoform 2 ...
+            m = re.search(r"\|([A-Z0-9]+(?:-\d+)?)\|", hdr)
+            cur_id = m.group(1) if m else hdr.split()[0]
             buf = []
         else:
             buf.append(ln.strip())
-    if header is not None:
-        seq = "".join(buf).replace(" ", "").replace("\r", "")
-        seqs.append((header, seq))
-    return seqs
+    if cur_id and buf:
+        out[cur_id] = "".join(buf).strip()
+    return out
 
-def _efetch_cds_fasta(nuccore_id: str, rettype: str) -> Optional[str]:
-    params = _eutils_params({"db": "nuccore", "id": nuccore_id, "rettype": rettype, "retmode": "text"})
-    r = SESSION.get(EUTILS_EFETCH, params=params, timeout=DEFAULT_TIMEOUT)
-    if r.status_code != 200:
-        return None
-    return r.text
+def uniprot_sequence_from_json(entry: Dict) -> str:
+    v = entry.get("sequence", {}).get("value") or ""
+    return re.sub(r"\s+", "", v)
 
-def try_fetch_cds_for_uniprot(meta: Dict, protein_seq: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    ids = extract_nuccore_ids_from_uniprot_meta(meta)
-    for acc in ids[:5]:
-        aa_txt = _efetch_cds_fasta(acc, "fasta_cds_aa")
-        if not aa_txt:
+def uniprot_taxonomy(entry: Dict) -> Tuple[str, Optional[int]]:
+    org = entry.get("organism", {}).get("scientificName") or "?"
+    taxid = entry.get("organism", {}).get("taxonId")
+    try:
+        taxid = int(taxid) if taxid is not None else None
+    except Exception:
+        taxid = None
+    return org, taxid
+
+def extract_features_as_regions(entry: Dict, seq_len: int) -> List[Region]:
+    cfg = CONFIG["regions"]
+    if not cfg.get("use_uniprot_features", True):
+        return []
+
+    incl = set(t.lower() for t in cfg.get("include_feature_types", []))
+    point_flank = int(cfg.get("point_flank", 5))   # ±5 por padrão
+    min_len = int(cfg.get("default_min_len", 1))
+    do_merge = bool(cfg.get("merge_overlaps", True))
+
+    out: List[Region] = []
+    for feat in entry.get("features", []) or []:
+        ftype = (feat.get("type") or "").lower()
+        if incl and ftype not in incl:
             continue
-        aa_list = _parse_fasta_multi(aa_txt)
-        for hdr, aa_seq in aa_list:
-            if aa_seq == protein_seq:
-                key = hdr.split(" ")[0]
-                na_txt = _efetch_cds_fasta(acc, "fasta_cds_na")
-                if not na_txt:
-                    continue
-                na_list = _parse_fasta_multi(na_txt)
-                for hdr2, na_seq in na_list:
-                    if hdr2.split(" ")[0] == key and len(na_seq) == 3 * len(aa_seq):
-                        return na_seq, acc, key
-                for hdr2, na_seq in na_list:
-                    if len(na_seq) == 3 * len(aa_seq):
-                        return na_seq, acc, hdr2.split(" ")[0]
-    return None, None, None
 
-# --- Novo: CDS a partir de RefSeq protein (fallback NCBI-only) ---
-def _elink_protein_to_nuccore_ids(refseq_acc: str) -> List[str]:
-    # tenta alguns linknames comuns; se falhar, usa o default
-    out: List[str] = []
-    for linkname in ("protein_nuccore_mrna", "protein_nuccore", None):
-        params = _eutils_params({
-            "dbfrom": "protein",
-            "db": "nuccore",
-            "id": refseq_acc,
-        })
-        if linkname:
-            params["linkname"] = linkname
-        r = SESSION.get(EUTILS_ELINK, params=params, timeout=DEFAULT_TIMEOUT)
-        if r.status_code != 200:
+        loc = feat.get("location") or {}
+        beg = loc.get("start", {}).get("value")
+        end = loc.get("end", {}).get("value")
+        if beg is None or end is None:
             continue
         try:
-            root = ET.fromstring(r.text)
-            ids = [e.text for e in root.findall(".//LinkSetDb/Link/Id") if e.text]
-            out.extend(ids)
+            beg = int(beg); end = int(end)
         except Exception:
             continue
-    # remover duplicatas preservando ordem
-    seen=set(); uniq=[]
-    for x in out:
-        if x not in seen:
-            seen.add(x); uniq.append(x)
-    return uniq
 
-def try_fetch_cds_for_refseq_protein(refseq_acc: str, protein_seq: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    nuccores = _elink_protein_to_nuccore_ids(refseq_acc)
-    for acc in nuccores[:10]:
-        aa_txt = _efetch_cds_fasta(acc, "fasta_cds_aa")
-        if not aa_txt:
-            continue
-        aa_list = _parse_fasta_multi(aa_txt)
-        hit_keys = []
-        for hdr, aa_seq in aa_list:
-            if aa_seq == protein_seq:
-                hit_keys.append(hdr.split(" ")[0])
-        if not hit_keys:
-            continue
-        na_txt = _efetch_cds_fasta(acc, "fasta_cds_na")
-        if not na_txt:
-            continue
-        na_list = _parse_fasta_multi(na_txt)
-        for hdr2, na_seq in na_list:
-            key2 = hdr2.split(" ")[0]
-            if key2 in hit_keys and len(na_seq) == 3 * len(protein_seq):
-                return na_seq, acc, key2
-    return None, None, None
+        note = (feat.get("description") or "")[:140].strip()
 
-_CODON_PREF = {
-    "A": "GCT", "R": "CGT", "N": "AAT", "D": "GAT", "C": "TGT",
-    "Q": "CAA", "E": "GAA", "G": "GGT", "H": "CAT", "I": "ATT",
-    "L": "CTG", "K": "AAA", "M": "ATG", "F": "TTT", "P": "CCT",
-    "S": "TCT", "T": "ACT", "W": "TGG", "Y": "TAT", "V": "GTG",
-    "*": "TAA",
-}
+        # ---- Flanco SOMENTE para feature pontual ----
+        if beg == end:
+            beg = max(1, beg - point_flank)
+            end = min(seq_len, end + point_flank)
+        # (Se for intervalo, não aplica flanco)
 
-def naive_reverse_translate(protein_seq: str) -> str:
-    return "".join(_CODON_PREF.get(aa, "NNN") for aa in protein_seq)
+        if end >= beg and (end - beg + 1) >= min_len:
+            out.append(Region(beg, end, ftype.upper(), note))
 
-def nt_segments_for_regions(regs: List[Region], cds_na_seq: str) -> List[Tuple[str, int, int, str, str, str]]:
+    # Mescla sobreposições do MESMO tipo, se solicitado
+    if do_merge and out:
+        out.sort(key=lambda r: (r.tag, r.start_1based, r.end_1based))
+        merged: List[Region] = []
+        cur = out[0]
+        for r in out[1:]:
+            if r.tag == cur.tag and r.start_1based <= cur.end_1based + 1:
+                # funde intervalos contíguos/overlap do mesmo tipo
+                cur.end_1based = max(cur.end_1based, r.end_1based)
+            else:
+                merged.append(cur)
+                cur = r
+        merged.append(cur)
+        out = merged
+
+    if cfg.get("add_full", True):
+        out.insert(0, Region(1, seq_len, "FULL", "FULL"))
+
+    return out
+
+# =========================
+# UniProt ⇄ outras bases
+# =========================
+def uniprot_search_by_refseq_protein(refseq_acc: str) -> Optional[str]:
     """
-    Retorna lista de tuplas (tag, start, end, dna, mrna, note),
-    onde tag = "SOURCE:TYPE" e note carrega a descrição/anotação da região.
+    Tenta mapear RefSeq Protein → UniProt (ACC canônico).
+    Usa REST search por xref:RefSeq:ACC. Retorna ACC (sem isoforma) se achar.
     """
-    segs: List[Tuple[str, int, int, str, str, str]] = []
-    for r in regs:
-        s = max(0, (r.start_1based - 1) * 3)
-        e = min(len(cds_na_seq), r.end_1based * 3)
-        if s >= e:
+    q_variants = [
+        f"xref:RefSeq:{refseq_acc}",
+        f"database:RefSeq {refseq_acc}",
+    ]
+    for q in q_variants:
+        url = "https://rest.uniprot.org/uniprotkb/search"
+        params = {"query": q, "format": "json", "size": "1", "fields": "accession"}
+        try:
+            r = _http_retry("GET", url, params=params)
+            j = r.json()
+            results = j.get("results", []) or []
+            if results:
+                return results[0]["primaryAccession"]
+        except Exception:
             continue
-        dna = cds_na_seq[s:e]
-        mrna = dna.replace("T", "U").replace("t", "u")
-        note = r.note or ""
-        segs.append((f"{r.source}:{r.type}", r.start_1based, r.end_1based, dna, mrna, note))
-    return segs
-
-# ----------------------------------------------------------------------------
-# API watch (placeholder)
-# ----------------------------------------------------------------------------
-def check_api_updates(config: Dict, format_vars: Optional[Dict] = None) -> Optional[str]:
     return None
 
-# ----------------------------------------------------------------------------
-# Relatório .txt
-# ----------------------------------------------------------------------------
-def write_report_txt(path: str, *, context: Dict) -> None:
-    """Gera um relatório .txt consolidando config, resumo, regiões e sequências, com notas das regiões no cabeçalho de cada bloco."""
-    lines: List[str] = []
-    lines.append("# Relatório de Execução — Pipeline funcional")
-    lines.append(f"Data/hora: {datetime.now().isoformat(timespec='seconds')}")
-    lines.append("")
-    lines.append("## Descrição do processo")
-    lines.append("1) Identificação da proteína (PDB/UniProt/NCBI) e espécie.")
-    lines.append("2) Coleta de regiões funcionais (UniProt / Pfam / NCBI).")
-    lines.append("3) Geração de janelas pelas regiões ± flancos.")
-    lines.append("4) BLASTP intra-espécie por janela (opcional).")
-    lines.append("5) Agregação por posição absoluta e anotação em colchetes (ref primeiro).")
-    lines.append("6) Mapeamento para DNA/mRNA real (CDS) quando possível; fallback retrotradução.")
-    lines.append("")
+# ========== (1) ncbi_gene — choose_best_uniprot_isoform com kwargs inesperado ==========
+def choose_best_uniprot_isoform(
+    accs: List[str],
+    isoform_policy: str = "longest",
+    refseq_hint_seq: Optional[str] = None
+) -> Optional[str]:
+    """
+    Escolhe uma isoforma UniProt dentre 'accs'.
+    - isoform_policy="longest": pega a mais longa
+    - se refseq_hint_seq vier, prioriza ACCs com comprimento igual ao da dica (seq RefSeq)
+    """
+    if not accs:
+        return None
 
-    # Config (resumo seguro)
-    lines.append("## Config usada (resumo)")
+    hint_len = len(refseq_hint_seq) if refseq_hint_seq else None
+
+    def _seq_len_for_acc(acc: str) -> int:
+        try:
+            fx = fetch_uniprot_fasta(acc, include_isoforms=False)
+            # fetch_uniprot_fasta retorna dict {id: seq} — pega a primeira sequência
+            if isinstance(fx, dict) and fx:
+                return len(next(iter(fx.values())))
+            # fallback se alguma implementação retornar str
+            if isinstance(fx, str):
+                return len(fx)
+        except Exception:
+            pass
+        return 0
+
+    scored: List[Tuple[int, str]] = []
+    for acc in accs:
+        L = _seq_len_for_acc(acc)
+        score = 0
+        if hint_len and L == hint_len:
+            score += 1_000_000
+        if isoform_policy == "longest":
+            score += L
+        scored.append((score, acc))
+
+    scored.sort(reverse=True)
+    return scored[0][1] if scored else accs[0]
+
+# =========================
+# PDBe SIFTS (PDB → UniProt)
+# =========================
+def fetch_pdb_uniprot_mappings(pdb_id: str) -> List[PDBUniProtMap]:
+    """
+    PDBe SIFTS: PDB -> UniProt mapping
+    https://www.ebi.ac.uk/pdbe/api/mappings/uniprot/{pdb_id}
+
+    Estrutura (simplificada):
+    {
+      "<pdb_id>": {
+        "UniProt": {
+          "<uniprot_acc>": {
+            "mappings": [
+              {"chain_id": "A", "unp_start": 35, "unp_end": 220, ...},
+              ...
+            ],
+            "sequence_length": 250,
+            ...
+          },
+          ...
+        }
+      }
+    }
+    """
+    url = f"https://www.ebi.ac.uk/pdbe/api/mappings/uniprot/{pdb_id.lower()}"
+    r = _http_retry("GET", url)
+    j = r.json()
+
+    maps: List[PDBUniProtMap] = []
+    block = j.get(pdb_id.lower())
+    if not block:
+        return maps
+
+    uni = block.get("UniProt") or {}
+    for acc, obj in uni.items():
+        seq_len = None
+        try:
+            seq_len = int(obj.get("sequence_length") or 0) or None
+        except Exception:
+            seq_len = None
+
+        for m in (obj.get("mappings") or []):
+            # campos robustos, com fallback
+            chain = (m.get("chain_id") or m.get("chain") or "?")
+            try:
+                start = int(m.get("unp_start") or 1)
+                end   = int(m.get("unp_end") or start)
+            except Exception:
+                start, end = 1, 1
+
+            # coverage fornecida pela API ou reconstituída
+            cov = m.get("coverage")
+            if cov is None:
+                if seq_len and end >= start:
+                    cov = (end - start + 1) / float(seq_len)
+                else:
+                    cov = 0.0
+            try:
+                cov = max(0.0, min(1.0, float(cov)))
+            except Exception:
+                cov = 0.0
+
+            maps.append(PDBUniProtMap(uniprot_acc=acc, chain=str(chain), coverage=cov))
+
+    return maps
+
+def choose_best_mapping(maps: List[PDBUniProtMap]) -> PDBUniProtMap:
+    if not maps: raise ValueError("Sem mapeamentos SIFTS")
+    return max(maps, key=lambda m: m.coverage)
+
+# =========================
+# Cross-refs UniProt → nuccore/protein
+# =========================
+def extract_nuccore_and_prot_from_uniprot(entry: Dict) -> Tuple[List[str], List[str]]:
+    nuccore: List[str] = []  # NM_, XM_, etc
+    prot_ids: List[str] = [] # NP_, XP_, YP_ etc
+    for x in entry.get("uniProtKBCrossReferences", []) or []:
+        db = (x.get("database") or "").upper()
+        xid = (x.get("id") or "").strip()
+        if db == "REFSEQ" and xid:
+            if re.match(r"^[NXYP]P_[0-9]+\.[0-9]+$", xid):
+                prot_ids.append(xid)
+        if db in ("REFSEQ","EMBL","GENBANK","DDBJ"):
+            for p in x.get("properties", []) or []:
+                k = (p.get("key") or "").lower()
+                v = (p.get("value") or "").strip()
+                if not v: continue
+                if "nucleotide" in k or "nucleotid" in k:
+                    parts = re.split(r"[;,]\s*", v)
+                    for s in parts:
+                        if re.match(r"^[A-Z]{1,3}[_\.][A-Za-z0-9_\.]+$", s):
+                            nuccore.append(s)
+    nuccore = list(dict.fromkeys(nuccore))
+    prot_ids = list(dict.fromkeys(prot_ids))
+    return nuccore, prot_ids
+
+# =========================
+# (2) ncbi_protein — fallbacks RefSeq→UniProt e GenPept features
+# =========================
+def _strip_refseq_version(acc: str) -> str:
+    """
+    Remove a versão de um accession RefSeq, se existir.
+    Ex.: NP_123.1 -> NP_123 ; XP_054213393.1 -> XP_054213393
+    """
     try:
-        lines.append(json.dumps({
-            "input.source": CONFIG["input"]["source"],
-            "regions.mode": CONFIG["regions"]["mode"],
-            "regions.include_ncbi_protein_features": CONFIG["regions"].get("include_ncbi_protein_features", False),
-            "blast.enable": CONFIG["blast"]["enable"],
-            "variation_layers": {k:v["enable"] for k,v in CONFIG.get("external_layers",{}).items()},
-            "filters.enabled": CONFIG["variation_filters"]["enabled"],
-        }, indent=2))
+        return acc.split('.')[0]
     except Exception:
-        lines.append(json.dumps(CONFIG, indent=2))
-    lines.append("")
+        return acc
 
-    # Fonte & Mapeamento (quando existir)
-    mapping = context.get("mapping") or {}
-    if mapping:
-        lines.append("## Fonte & Mapeamento")
-        for k in ["input_source","input_id","resolved_gene","resolved_refseq","mapped_uniprot","notes"]:
-            if mapping.get(k) is not None:
-                lines.append(f"- {k}: {mapping.get(k)}")
-        lines.append("")
+def map_refseq_protein_to_uniprot(ncbi_prot_acc: str) -> List[str]:
+    """
+    Mapeia RefSeq Protein (NP_/XP_/YP_/WP_/etc) → UniProt ACC(s) de forma robusta.
+    Estratégia (ordem):
+      1) xref direto (com versão e sem versão):   xref:RefSeq:ACC
+      2) busca por base de dados:                 database:RefSeq AND "ACC"
+      3) xref alternativo utilizado em alguns:    xref:RefSeq_Protein:ACC
+      4) Fallback por busca livre (texto):        "ACC" e ACC (com/sem versão)
+         - cobre casos TrEMBL sem xref curado, mas onde o accession aparece no texto/descrição
+    - Nunca levanta exceção por 400/5xx: ignora a tentativa e prossegue.
+    - Retorna lista deduplicada preservando ordem.
+    - Loga consultas tentadas quando não houver resultado e blast_progress=True.
+    """
+    base = _strip_refseq_version(ncbi_prot_acc)
+    tried_queries: List[str] = []
 
-    # Proteína
-    prot = context.get("protein", {})
-    lines.append("## Proteína")
-    lines.append(f"Acesso: {prot.get('accession','?')}")
-    lines.append(f"Nome: {prot.get('name','')}")
-    lines.append(f"Espécie: {prot.get('organism','?')} (taxid={prot.get('taxid','?')})")
-    lines.append(f"Tamanho (aa): {prot.get('length','?')}")
-    lines.append("")
+    def _try_query(q: str) -> List[str]:
+        url = "https://rest.uniprot.org/uniprotkb/search"
+        params = {"query": q, "fields": "accession", "format": "json", "size": "50"}
+        tried_queries.append(f"{url}?query={q}")
+        try:
+            r = _http_retry("GET", url, params=params)
+            j = r.json() or {}
+            out: List[str] = []
+            for it in (j.get("results") or []):
+                acc = it.get("primaryAccession") or it.get("uniProtkbId")
+                if acc:
+                    out.append(str(acc))
+            return out
+        except Exception:
+            # qualquer erro (400/5xx/network) -> retorna vazio e segue
+            return []
 
-    # Regiões
-    lines.append("## Regiões-alvo (após expansão)")
-    for r in context.get("regions", []):
-        note = f" — {r['note']}" if r.get('note') else ""
-        lines.append(f"- {r['source']}:{r['type']} {r['start']}-{r['end']}{note}")
-    lines.append("")
+    results: List[str] = []
 
-    # BLAST resumo
-    bl = context.get("blast", {})
-    lines.append("## BLAST")
-    lines.append(f"Habilitado: {'SIM' if CONFIG['blast']['enable'] else 'NÃO'}; Janelas processadas: {bl.get('windows',0)}; Banco: {BLAST_DB}; Filtro: {bl.get('filter','None')}")
-    lines.append(f"Identidade mínima: {MIN_PCT_IDENTITY}%; Cobertura mínima: {MIN_QUERY_COVERAGE}")
-    lines.append(f"Variações (posições únicas) — BLAST: {bl.get('variant_positions_blast', 0)}; UniProt VARIANT: {bl.get('variant_positions_uniprot', 0)}; Proteins Variation: {bl.get('variant_positions_proteins', 0)}; Filtradas: {bl.get('variant_positions_filtered', 0)}")
-    lines.append("")
+    # ---- (1) xref direto (com e sem versão) ----
+    results += _try_query(f"xref:RefSeq:{ncbi_prot_acc}")
+    if not results:
+        results += _try_query(f"xref:RefSeq:{base}")
 
-    # DNA/mRNA + AA por região (com nota/descrição junto ao cabeçalho)
-    lines.append("## DNA/mRNA por região (completo) + AA anotado")
-    aa_index = {(a["tag"], a["start"], a["end"]): a["aa"] for a in context.get("aa_regions", [])}
-    if not aa_index and context.get("aa_regions_obs"):
-        aa_index = {(a["tag"], a["start"], a["end"]): a["aa"] for a in context.get("aa_regions_obs", [])}
+    # ---- (2) database:RefSeq AND "<acc>" (com e sem versão) ----
+    if not results:
+        results += _try_query(f'database:RefSeq AND "{ncbi_prot_acc}"')
+    if not results:
+        results += _try_query(f'database:RefSeq AND "{base}"')
 
-    for seg in context.get("nt_segments", []):
-        key = (seg["tag"], seg["start"], seg["end"])
-        aa_line = aa_index.get(key, "")
-        header = f"{seg['tag']} {seg['start']}-{seg['end']}"
-        if seg.get("note"):
-            header += f" — {seg['note']}"
-        lines.append(header)
-        if aa_line:
-            lines.append(f"AA  : {aa_line}")
-        lines.append(f"DNA : {seg['dna']}")
-        lines.append(f"mRNA: {seg['mrna']}")
-        lines.append("")
+    # ---- (3) xref alternativo RefSeq_Protein (com e sem versão) ----
+    if not results:
+        results += _try_query(f"xref:RefSeq_Protein:{ncbi_prot_acc}")
+    if not results:
+        results += _try_query(f"xref:RefSeq_Protein:{base}")
 
-    # Sequência AA completa
-    if prot.get("sequence"):
-        lines.append("## Sequência de aminoácidos (completa)")
-        lines.append(prot["sequence"])
-        lines.append("")
+    # ---- (4) Fallback por busca livre (texto) ----
+    # primeiro com aspas (match mais estrito), depois sem aspas
+    if not results:
+        results += _try_query(f'"{ncbi_prot_acc}"')
+    if not results:
+        results += _try_query(f'"{base}"')
+    if not results:
+        results += _try_query(ncbi_prot_acc)
+    if not results:
+        results += _try_query(base)
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-    print(f"Relatório salvo em: {path}")
+    # Dedup preservando ordem
+    results = list(dict.fromkeys(results))
 
-# ----------------------------------------------------------------------------
-# Orquestração — pipeline com UniProt
-# ----------------------------------------------------------------------------
-def build_regions(sequence: str, accession: str, meta: Dict) -> List[Region]:
-    mode = CONFIG["regions"]["mode"]
-    regs: List[Region] = []
+    if not results and CONFIG.get("output", {}).get("blast_progress", False):
+        print(f"[DIAG] UniProt search sem resultados para {ncbi_prot_acc}. Consultas tentadas: {tried_queries}")
 
-    if mode in ("uniprot_features", "both"):
-        ft_types = _resolve_feature_types(CONFIG["regions"]["feature_types"])
-        regs.extend(fetch_uniprot_functional_regions(meta, ft_types))
+    return results
 
-    if mode in ("pfam", "both"):
-        pf = fetch_pfam_domains(accession)
-        for d in pf:
-            regs.append(Region(d.start_1based, d.end_1based, "PFAM", d.accession, d.description))
+def extract_regions_from_genpept_features(refseq_prot_acc: str) -> List[Region]:
+    """
+    Fallback de features a partir do GenPept (db=protein, rettype=gp).
+    Converte as features para Region (somente intervalares; sítios pontuais recebem flanco padrão de 5 aa).
+    """
+    # baixa o registro GenPept
+    handle = Entrez.efetch(db="protein", id=refseq_prot_acc, rettype="gp", retmode="text")
+    record = SeqIO.read(handle, "genbank")
+    handle.close()
 
-    if CONFIG["regions"].get("include_ncbi_protein_features", False):
-        refseqs = extract_refseq_proteins_from_uniprot_meta(meta, prefer_np=True)
-        added = 0
-        for rs in refseqs[:3]:
-            ncbi_regs = fetch_ncbi_protein_features_to_regions(rs)
-            regs.extend(ncbi_regs)
-            added += len(ncbi_regs)
-        if added:
-            print(f"[INFO] NCBI features agregadas: {added} regiões (via RefSeq cross-ref).")
+    seq_len = len(record.seq) if record and record.seq else 0
+    out: List[Region] = []
+    flank = 5
 
-    L = len(sequence)
-    regs = expand_regions(
-        regs,
-        L,
-        CONFIG["regions"]["flank_left"],
-        CONFIG["regions"]["flank_right"],
-        CONFIG["regions"]["merge_overlaps"],
-    )
-    return regs
-
-def extract_refseq_proteins_from_uniprot_meta(meta: Dict, prefer_np: bool = True) -> List[str]:
-    ids: List[str] = []
-    for x in meta.get("uniProtKBCrossReferences", []) or []:
-        if x.get("database") == "RefSeq":
-            acc = x.get("id")
-            if acc and (acc.startswith("NP_") or acc.startswith("XP_")):
-                ids.append(acc)
-    if prefer_np:
-        nps = [a for a in ids if a.startswith("NP_")]
-        xps = [a for a in ids if a.startswith("XP_")]
-        return nps + xps
-    return ids
-
-def _core_pipeline_from_uniprot(accession: str, *, mapping_info: Optional[Dict]=None) -> None:
-    # Sequência + metadados UniProt
-    seq = fetch_uniprot_fasta(accession)
-    print(f"Tamanho da proteína: {len(seq)} aa")
-    meta = fetch_uniprot_meta(accession)
-
-    # Espécie / nome
-    org = meta.get("organism", {})
-    sci_name = org.get("scientificName") or ""
-    taxid = None
-    try:
-        taxid = int(org.get("taxonId"))
-    except Exception:
-        pass
-    prot_name = (meta.get("proteinDescription", {}).get("recommendedName", {}) or {}).get("fullName", {}).get("value", "")
-    print(f"Espécie: {sci_name} (taxid={taxid})")
-
-    # Regiões (UniProt/Pfam/NCBI, conforme sua build_regions)
-    regs = build_regions(seq, accession, meta)
-    print(f"Regiões-alvo (após expansão): {len(regs)}")
-    for r in regs[:10]:
-        extra = f" — {r.note}" if r.note else ""
-        print(f"  - {r.source}:{r.type} {r.start_1based}-{r.end_1based}{extra}")
-    if len(regs) > 10:
-        print(f"  … (+{len(regs)-10} regiões)")
-
-    windows = regions_to_windows(seq, regs) if regs else []
-    print(f"Janelas: {len(windows)}")
-
-    # BLAST opcional
-    vars_: List[Variant] = []
-    if CONFIG["blast"].get("enable", False):
-        entrez = f"txid{taxid}[ORGN]" if (SAME_SPECIES_ONLY and taxid) else None
-        print(f"BLAST: {len(windows)} janelas; filtro={entrez}")
-        vars_ = qblast_many(
-            windows,
-            entrez_query=entrez,
-            min_pct_identity=MIN_PCT_IDENTITY,
-            min_query_cov=MIN_QUERY_COVERAGE,
-            organism_filter_name=sci_name if SAME_SPECIES_ONLY else None,
-            hsp_log=False,
-            progress=CONFIG["output"]["blast_progress"],
-        )
-    else:
-        print("BLAST desabilitado por configuração.")
-
-    agg = variants_by_position(vars_)
-
-    # AA anotado + NT por região (com nota)
-    regs_for_nt = regs if regs else [Region(1, len(seq), "FULL", "FULL")]
-    aa_by_region = aa_regions_bracketed(seq, regs_for_nt, agg)
-
-    nt_segments: List[Tuple[str, int, int, str, str, str]] = []
-    if CONFIG["cds_mapping"]["enable"]:
-        cds_na, nuccore_src, header_key = try_fetch_cds_for_uniprot(meta, seq)
-        if cds_na and len(cds_na) == 3 * len(seq):
-            print(f"CDS encontrado em {nuccore_src} (nt={len(cds_na)}).")
-            nt_segments = nt_segments_for_regions(regs_for_nt, cds_na)
-        else:
-            print("Não foi possível mapear CDS real; usando retrotradução (código genético padrão).")
-            dna_full = naive_reverse_translate(seq)
-            nt_segments = nt_segments_for_regions(regs_for_nt, dna_full)
-    else:
-        dna_full = naive_reverse_translate(seq)
-        nt_segments = nt_segments_for_regions(regs_for_nt, dna_full)
-
-    # Impressão final — inclui nota no cabeçalho
-    print("\n## DNA/mRNA por região (completo) + AA anotado")
-    aa_index = {(a["tag"], a["start"], a["end"]): a["aa"] for a in aa_by_region}
-    for tag, ds, de, dna_seg, mrna_seg, note in nt_segments:
-        header = f"{tag} {ds}-{de}"
-        if note:
-            header += f" — {note}"
-        print(header)
-        aa_line = aa_index.get((tag, ds, de), "")
-        if aa_line:
-            print(f"AA  : {aa_line}")
-        print(f"DNA : {dna_seg}")
-        print(f"mRNA: {mrna_seg}")
-
-    # Contexto para UI/artefatos — inclui note nos segmentos
-    context = {
-        "mapping": mapping_info or {},
-        "protein": {
-            "accession": accession,
-            "name": prot_name,
-            "organism": sci_name,
-            "taxid": taxid,
-            "length": len(seq),
-            "sequence": seq,
-        },
-        "regions": [
-            {"source": r.source, "type": r.type, "start": r.start_1based, "end": r.end_1based, "note": r.note}
-            for r in regs
-        ],
-        "blast": {
-            "windows": len(windows),
-            "filter": (f"txid{taxid}[ORGN]" if (CONFIG['blast'].get('enable', False) and taxid) else "None"),
-            "variant_positions": len({p for p in agg.keys()}),
-
-            # chaves usadas pela UI (preencha se você agrega externas em outro lugar)
-            "variant_positions_blast": len({p for p in agg.keys()}),
-            "variant_positions_uniprot": 0,
-            "variant_positions_proteins": 0,
-            "variant_positions_filtered": 0,
-        },
-        "layers": {
-            "uniprot_variant_enabled": bool(CONFIG.get("external_layers",{}).get("uniprot_variant",{}).get("enable", False)),
-            "proteins_variation_enabled": bool(CONFIG.get("external_layers",{}).get("variation_api",{}).get("enable", False)),
-            "blast_enabled": bool(CONFIG.get("blast",{}).get("enable", False)),
-        },
-        "aa_regions": aa_by_region,
-        "aa_regions_obs": [],
-        "aa_regions_filtered": [],
-        "nt_segments": [
-            {"tag": tag, "start": ds, "end": de, "dna": dna, "mrna": mrna, "note": note}
-            for (tag, ds, de, dna, mrna, note) in nt_segments
-        ],
+    # mapeamento simples de tipos (GenPept → tags)
+    interval_types = {
+        "Region": "REGION",
+        "Site": "SITE",
+        "Domain": "DOMAIN",
+        "Repeat": "REPEAT",
+        "Motif": "MOTIF",
+        "Transmembrane": "TRANSMEMBRANE",
+        "Intramembrane": "INTRAMEMBRANE",
+        "Coiled-coil": "COILED COIL",
+        "Zinc finger": "ZINC FINGER",
+        "Signal peptide": "Signal peptide".upper(),
+        "Transit peptide": "TRANSIT PEPTIDE",
+        "Propeptide": "PROPEPTIDE",
+        "peptide": "PEPTIDE",
+        "Chain": "CHAIN",
+        "Topological domain": "TOPOLOGICAL DOMAIN",
+        "Active site": "ACTIVE SITE",
+        "Metal binding": "METAL BINDING",
+        "Binding site": "BINDING SITE",
+        "Glycosylation": "GLYCOSYLATION SITE",
+        "Lipidation": "LIPIDATION",
+        "Modified residue": "MODIFIED RESIDUE",
+        "Disulfide bond": "DISULFIDE BOND",
+        "Cross-link": "CROSS-LINK",
     }
 
-    report_path = CONFIG["output"]["report_txt"]
-    if report_path:
-        write_report_txt(report_path, context=context)
+    for feat in record.features:
+        if feat.type not in ("Region", "Site", "Domain", "Repeat", "Motif",
+                             "Transmembrane", "Intramembrane", "Coiled-coil",
+                             "Zinc finger", "Signal peptide", "Transit peptide",
+                             "Propeptide", "peptide", "Chain", "Topological domain",
+                             "Active site", "Metal binding", "Binding site",
+                             "Glycosylation", "Lipidation", "Modified residue",
+                             "Disulfide bond", "Cross-link"):
+            continue
 
-    arts = CONFIG["output"].get("artifacts_dir")
-    if arts:
+        tag = interval_types.get(feat.type, feat.type.upper())
+        note = ""
         try:
-            with open(os.path.join(arts, "context_summary.json"), "w", encoding="utf-8") as fh:
-                json.dump(context, fh, ensure_ascii=False, indent=2)
+            note = (feat.qualifiers.get("note", [""])[0] or "")[:140]
         except Exception:
             pass
 
-# ----------------------------------------------------------------------------
-# Fallback NCBI-only (sem UniProt)
-# ----------------------------------------------------------------------------
-def _core_pipeline_from_refseq_only(refseq_acc: str, *, mapping_info: Optional[Dict]=None) -> None:
-    print("[WARN] Executando em modo NCBI-only (sem mapeamento UniProt).")
+        # localização
+        try:
+            beg = int(feat.location.nofuzzy_start) + 1   # 1-based
+            end = int(feat.location.nofuzzy_end)
+        except Exception:
+            continue
 
-    # GenPept
-    gp_txt = fetch_ncbi_protein_gb_text(refseq_acc)
-    if not gp_txt:
-        print("[ERRO] Não foi possível obter GenPept para a proteína RefSeq.")
-        return
-    rec = SeqIO.read(StringIO(gp_txt), "gb")
-    seq = str(rec.seq)
-    print(f"Tamanho da proteína: {len(seq)} aa")
-    org_name = rec.annotations.get("organism") or "?"
+        if beg == end:
+            # flanco apenas para sítios pontuais
+            beg = max(1, beg - flank)
+            end = min(seq_len, end + flank)
 
-    # TaxID via ESummary
-    taxid = None
+        if end >= beg and (end - beg + 1) >= int(CONFIG["regions"]["default_min_len"]):
+            out.append(Region(beg, end, tag, note))
+
+    # FULL sempre presente
+    out.insert(0, Region(1, seq_len, "FULL", "FULL"))
+    return out
+
+# =========================
+# NCBI: protein→nuccore (elink) e GenBank → CDS correta
+# =========================
+def elink_protein_to_nuccore_accs(prot_acc: str) -> List[str]:
+    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi"
+    params = {"dbfrom":"protein","db":"nuccore","id":prot_acc,"retmode":"json"}
+    if NCBI_API_KEY: params["api_key"] = NCBI_API_KEY
+    if NCBI_EMAIL:   params["email"] = NCBI_EMAIL
+    r = _http_retry("GET", url, params=params)
+    j = r.json()
+    out = []
     try:
-        params = _eutils_params({"db":"protein","id":refseq_acc})
-        r = SESSION.get(EUTILS_ESUMMARY, params=params, timeout=DEFAULT_TIMEOUT)
-        if r.status_code == 200:
-            root = ET.fromstring(r.text)
-            for doc in root.findall(".//DocSum"):
-                for itm in doc.findall("Item"):
-                    if itm.get("Name") == "TaxId":
-                        taxid = int(itm.text or "0")
-                        break
+        linksets = j["linksets"][0].get("linksetdbs", []) or []
+        ids = []
+        for ls in linksets:
+            ids.extend(ls.get("links", []) or [])
+        if ids:
+            url2 = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+            p2 = {"db":"nuccore","id":",".join(str(x) for x in ids),"rettype":"acc","retmode":"text"}
+            if NCBI_API_KEY: p2["api_key"] = NCBI_API_KEY
+            if NCBI_EMAIL:   p2["email"] = NCBI_EMAIL
+            r2 = _http_retry("GET", url2, params=p2)
+            for line in r2.text.splitlines():
+                acc = line.strip()
+                if acc: out.append(acc)
     except Exception:
         pass
-    print(f"Espécie: {org_name} (taxid={taxid})")
+    return list(dict.fromkeys(out))
 
-    # Regiões a partir das features NCBI
-    ncbi_regs = fetch_ncbi_protein_features_to_regions(refseq_acc)
-    regs = expand_regions(
-        ncbi_regs, len(seq),
-        CONFIG["regions"]["flank_left"],
-        CONFIG["regions"]["flank_right"],
-        CONFIG["regions"]["merge_overlaps"],
+def pick_cds_from_genbank(record, prot_seq: str, candidate_protein_ids: List[str]) -> Tuple[Optional[str], Optional[str], Optional[Dict]]:
+    """Retorna (cds_nt, translation, feat_meta) da CDS que:
+       - tem /protein_id em candidate_protein_ids OU
+       - tem /translation == prot_seq (exata, ignorando '*' final)
+    """
+    best = None
+    for feat in record.features:
+        if feat.type != "CDS": continue
+        q = feat.qualifiers or {}
+        protein_id = (q.get("protein_id",[None])[0]) or None
+        translation = (q.get("translation",[None])[0]) or None
+        codon_start = int((q.get("codon_start",[1])[0]) or 1)
+        transl_table = int((q.get("transl_table",[1])[0]) or 1)
+
+        spliced = str(feat.extract(record.seq)).upper()
+        if codon_start in (2,3):
+            spliced = spliced[codon_start-1:]
+        if len(spliced) % 3 != 0:
+            spliced = spliced[:len(spliced)//3*3]
+
+        try:
+            tr = str(Seq(spliced).translate(table=transl_table, to_stop=False))
+        except Exception:
+            tr = None
+        tr_nostop = tr[:-1] if (tr and tr.endswith("*")) else tr
+
+        match_protid = (protein_id in set(candidate_protein_ids)) if protein_id else False
+        prot_seq_nostop = prot_seq[:-1] if prot_seq.endswith("*") else prot_seq
+        match_translation = (translation == prot_seq) or (tr_nostop == prot_seq_nostop)
+
+        score = (1 if match_protid else 0, 1 if match_translation else 0)
+        if score == (0,0):
+            continue
+        meta = {"protein_id": protein_id, "codon_start": codon_start, "transl_table": transl_table}
+        cand = (spliced, translation, meta, score)
+        if best is None or cand[3] > best[3]:
+            best = cand
+    if not best:
+        return None, None, None
+    return best[0], best[1], best[2]
+
+def find_cds_strict(nuccore_accs: List[str], prot_seq: str, candidate_protein_ids: List[str]) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[Dict]]:
+    """Percorre nuccores e retorna a primeira CDS consistente.
+       Out: (picked_nuccore, cds_nt, translation, feat_meta)
+    """
+    for acc in nuccore_accs:
+        try:
+            if CONFIG["output"]["blast_progress"]:
+                print(f"[DIAG] Verificando CDS em {acc} …")
+            handle = Entrez.efetch(db="nuccore", id=acc, rettype="gb", retmode="text")
+            record = SeqIO.read(handle, "genbank")
+            handle.close()
+            cds_nt, translation, meta = pick_cds_from_genbank(record, prot_seq, candidate_protein_ids)
+            if not cds_nt:
+                continue
+            prot_seq_nostop = prot_seq[:-1] if prot_seq.endswith("*") else prot_seq
+            if len(cds_nt) != 3*len(prot_seq_nostop):
+                tr = str(Seq(cds_nt).translate(to_stop=False))
+                if tr.endswith("*"):
+                    tr = tr[:-1]
+                if tr != prot_seq_nostop:
+                    continue
+            return acc, cds_nt, translation, meta
+        except Exception as e:
+            if CONFIG["output"]["blast_progress"]:
+                print(f"[DIAG]  - falha em {acc}: {e}")
+            continue
+    return None, None, None, None
+
+# =========================
+# TaxID helpers — mesma espécie p/ AA e NT
+# =========================
+def _get_tax_from_genpept(prot_acc: str) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Busca taxid e nome do organismo direto do GenPept (RefSeq Protein).
+    - taxid: em feature 'source' (qualifier 'db_xref': 'taxon:<id>')
+    - organismo: 'organism' nas annotations ou qualifier 'organism' em 'source'
+    """
+    tax = None
+    org = None
+    try:
+        handle = Entrez.efetch(db="protein", id=prot_acc, rettype="gp", retmode="text")
+        record = SeqIO.read(handle, "genbank")
+        handle.close()
+    except Exception:
+        return None, None
+
+    try:
+        org = record.annotations.get("organism")
+    except Exception:
+        org = None
+    try:
+        for feat in record.features:
+            if feat.type == "source":
+                for x in feat.qualifiers.get("db_xref", []):
+                    if x.startswith("taxon:"):
+                        tax = int(x.split(":")[1])
+                if not org:
+                    org = (feat.qualifiers.get("organism", [""])[0] or None)
+    except Exception:
+        pass
+    return tax, org
+
+def ensure_blast_same_species_filters_from_taxid(taxid: Optional[int], species: Optional[str]=None):
+    """
+    Se same_species_only=True e houver taxid, setamos entrez_query para AA e NT.
+    Também fixa o alvo esperado p/ auditoria (espécie).
+    """
+    global _EXPECTED_TAXID, _EXPECTED_SPECIES
+    if species:
+        _EXPECTED_SPECIES = species
+    if taxid and CONFIG.get("blast", {}).get("same_species_only", False):
+        q = f"txid{int(taxid)}[ORGN]"
+        CONFIG["blast"]["protein"]["entrez_query"] = q
+        CONFIG["blast"]["nt"]["entrez_query"] = q
+        _EXPECTED_TAXID = int(taxid)
+        if CONFIG.get("output", {}).get("blast_progress", False):
+            print(f"[BLAST] Filtro por espécie aplicado: {q}")
+
+# =========================
+# BLAST por região
+# =========================
+def blastp_region(seq_window: str, entrez_query: Optional[str], params: Dict) -> Dict[int, set]:
+    if not seq_window or not re.search(r"[A-Z]", seq_window):
+        return {}
+    handle = NCBIWWW.qblast(
+        program="blastp",
+        database=params.get("db", "nr"),
+        sequence=seq_window,
+        hitlist_size=int(params.get("hitlist_size", 25)),
+        expect=float(params.get("expect", 1e-5)),
+        entrez_query=entrez_query,
+        service="plain",
+        megablast=False
     )
-    print(f"Regiões-alvo (NCBI features, após expansão): {len(regs)}")
-    for r in regs[:10]:
-        extra = f" — {r.note}" if r.note else ""
-        print(f"  - {r.source}:{r.type} {r.start_1based}-{r.end_1based}{extra}")
-    if len(regs) > 10:
-        print(f"  … (+{len(regs)-10} regiões)")
+    rec = NCBIXML.read(handle)
+    handle.close()
+    variants: Dict[int, set] = {}
+    L = len(seq_window)
+    min_id = float(params.get("min_identity", 0.97))
+    min_cov = float(params.get("min_query_coverage", 0.95))
+    region_tag = params.get("audit_region_tag", "?")
+    db_used = params.get("db", "nr")
 
-    windows = regions_to_windows(seq, regs) if regs else []
-    print(f"Janelas: {len(windows)}")
+    for aln in rec.alignments:
+        for hsp in aln.hsps:
+            qseq = hsp.query
+            hseq = hsp.sbjct
+            q_aligned = sum(1 for c in qseq if c != '-')
+            if q_aligned == 0:
+                continue
+            cov = q_aligned / L
+            if cov < min_cov:
+                continue
+            ident = hsp.identities / q_aligned
+            if ident < min_id:
+                continue
 
-    # BLAST opcional
-    vars_: List[Variant] = []
-    if CONFIG["blast"].get("enable", False):
-        entrez = f"txid{taxid}[ORGN]" if (SAME_SPECIES_ONLY and taxid) else None
-        print(f"BLAST: {len(windows)} janelas; filtro={entrez}")
-        vars_ = qblast_many(
-            windows,
-            entrez_query=entrez,
-            min_pct_identity=MIN_PCT_IDENTITY,
-            min_query_cov=MIN_QUERY_COVERAGE,
-            organism_filter_name=org_name if SAME_SPECIES_ONLY else None,
-            hsp_log=False,
-            progress=CONFIG["output"]["blast_progress"],
-        )
-    else:
-        print("BLAST desabilitado por configuração.")
+            # ===== Auditoria: log/CSV do hit aceito =====
+            _audit_hit(
+                kind="protein",
+                db=db_used,
+                region_tag=region_tag,
+                accession=getattr(aln, "accession", "") or "",
+                hit_def=getattr(aln, "hit_def", "") or "",
+                pid=ident,
+                cov=cov,
+                hsp_query_len=q_aligned
+            )
 
-    agg = variants_by_position(vars_)
+            # ===== variantes / colchetes =====
+            qpos = 0
+            for qc, hc in zip(qseq, hseq):
+                if qc != '-':
+                    qpos += 1
+                    if hc != '-' and qc != hc:
+                        variants.setdefault(qpos, set()).add(hc)
+    return variants
 
-    # AA anotado + NT por região (com nota)
-    regs_for_nt = regs if regs else [Region(1, len(seq), "FULL", "FULL")]
-    aa_by_region = aa_regions_bracketed(seq, regs_for_nt, agg)
+def blastp_region_multi(seq_window: str, entrez_query: Optional[str], params: Dict) -> Dict[int, set]:
+    """
+    Executa BLASTp em múltiplos bancos (params['dbs'] ou [params['db']]) e
+    retorna a UNIÃO dos conjuntos de alternativas por posição.
+    Respeita min_identity / min_query_coverage do próprio 'params'.
+    """
+    dbs = params.get("dbs")
+    if not dbs:
+        dbs = [params.get("db", "nr")]
+    union_variants: Dict[int, set] = {}
 
-    nt_segments: List[Tuple[str, int, int, str, str, str]] = []
-    if CONFIG["cds_mapping"]["enable"]:
-        cds_na, nuccore_src, header_key = try_fetch_cds_for_refseq_protein(refseq_acc, seq)
-        if cds_na and len(cds_na) == 3 * len(seq):
-            print(f"CDS encontrado em {nuccore_src} (nt={len(cds_na)}).")
-            nt_segments = nt_segments_for_regions(regs_for_nt, cds_na)
+    for db in dbs:
+        if CONFIG["output"]["blast_progress"]:
+            print(f"[BLASTp] Rodando em {db}… (window={len(seq_window)} aa)")
+        local = blastp_region(seq_window, entrez_query, {**params, "db": db})
+        for pos, alts in local.items():
+            union_variants.setdefault(pos, set()).update(alts)
+
+    return union_variants
+
+def blastn_region(nt_window: str, db: str, params: Dict, is_mrna: bool=False) -> Dict[int, set]:
+    """
+    BLASTn por janela. Trabalhamos em DNA (T). Para mRNA, convertemos U->T antes do BLAST.
+    Agora suporta entrez_query (mesmo filtro de espécie do AA).
+    Se CONFIG["blast"]["log_offspecies_preview"] = True e houver entrez_query,
+    roda uma 2ª passada só para LOG (sem afetar variantes) sem filtro de espécie.
+    """
+    if not nt_window or not re.search(r"[ACGTU]", nt_window, re.I):
+        return {}
+
+    query_dna = nt_window.upper().replace("U", "T")
+    entrez_q = params.get("entrez_query")
+    if CONFIG["output"]["blast_progress"]:
+        print(f"[BLASTn] Rodando em {db} (len={len(query_dna)} nt) "
+              f"{'(mesma espécie)' if entrez_q else '(todas as espécies)'}…")
+
+    handle = NCBIWWW.qblast(
+        program="blastn",
+        database=db,
+        sequence=query_dna,
+        hitlist_size=int(params.get("hitlist_size", 25)),
+        expect=float(params.get("expect", 1e-10)),
+        service="plain",
+        megablast=bool(params.get("megablast", True)),
+        entrez_query=entrez_q
+    )
+    rec = NCBIXML.read(handle); handle.close()
+
+    variants: Dict[int, set] = {}
+    L = len(query_dna)
+    min_id = float(params.get("min_identity", 0.98))
+    min_cov = float(params.get("min_query_coverage", 0.95))
+    region_tag = params.get("audit_region_tag", "?")
+
+    def _log_hits(rec_obj, level_label: str):
+        for aln in rec_obj.alignments:
+            # melhor HSP por alinhamento
+            best_cov = 0.0; best_pid = 0.0
+            best_hsp = None
+            for hsp in aln.hsps:
+                q_aligned = sum(1 for c in hsp.query if c != '-')
+                cov = (q_aligned / L) if L else 0.0
+                pid = (hsp.identities / q_aligned) if q_aligned else 0.0
+                if (pid, cov) > (best_pid, best_cov):
+                    best_pid, best_cov, best_hsp = pid, cov, hsp
+            _audit_hit(
+                kind="nucleotide",
+                db=f"{db}{level_label}",
+                region_tag=region_tag,
+                accession=getattr(aln, "accession", "") or "",
+                hit_def=getattr(aln, "hit_def", "") or "",
+                pid=best_pid,
+                cov=best_cov,
+                hsp_query_len=best_hsp.align_length if best_hsp else 0
+            )
+
+    # ---- HITS usados (com ou sem filtro de espécie) ----
+    if CONFIG["output"]["blast_progress"]:
+        _log_hits(rec, "")
+
+    for aln in rec.alignments:
+        for hsp in aln.hsps:
+            qseq = hsp.query.upper()
+            hseq = hsp.sbjct.upper()
+            q_aligned = sum(1 for c in qseq if c != '-')
+            if not q_aligned or (q_aligned / L) < min_cov:
+                continue
+            ident = (hsp.identities / q_aligned)
+            if ident < min_id:
+                continue
+            qpos = 0
+            for qc, hc in zip(qseq, hseq):
+                if qc != '-':
+                    qpos += 1
+                    if hc != '-' and qc != hc:
+                        variants.setdefault(qpos, set()).add(hc)
+
+    # ---- PREVIEW off-species (apenas log) ----
+    try:
+        if CONFIG["blast"].get("log_offspecies_preview", False) and entrez_q:
+            if CONFIG["output"]["blast_progress"]:
+                print("[BLASTn] Preview off-species (somente log; não altera variantes)…")
+            handle2 = NCBIWWW.qblast(
+                program="blastn",
+                database=db,
+                sequence=query_dna,
+                hitlist_size=min(int(params.get("hitlist_size", 25)), 5),
+                expect=float(params.get("expect", 1e-10)),
+                service="plain",
+                megablast=bool(params.get("megablast", True)),
+                entrez_query=None
+            )
+            rec2 = NCBIXML.read(handle2); handle2.close()
+            _log_hits(rec2, " PREVIEW")
+    except Exception as e:
+        if CONFIG["output"]["blast_progress"]:
+            print(f"[WARN] Preview off-species falhou: {e}")
+
+    return variants
+
+# =========================
+# Effatha builders
+# =========================
+def effatha_aa(seq: str, region: Region, local_variants: Dict[int, set]) -> str:
+    s = region.start_1based
+    e = region.end_1based
+    buf = []
+    for i, pos in enumerate(range(s, e+1), start=1):
+        ref = seq[pos-1]
+        alts = sorted(x for x in local_variants.get(i, set()) if x != ref)
+        if alts:
+            buf.append("[" + "/".join([ref] + alts) + "]")
         else:
-            print("Não foi possível mapear CDS real; usando retrotradução (código genético padrão).")
-            dna_full = naive_reverse_translate(seq)
-            nt_segments = nt_segments_for_regions(regs_for_nt, dna_full)
+            buf.append(ref)
+    return "".join(buf)
+
+def effatha_nt(nt_seq: str, nt_variants: Dict[int, set], use_u: bool=False) -> str:
+    buf = []
+    for i, ref in enumerate(nt_seq, start=1):
+        ref_char = ref
+        alts = sorted(x for x in nt_variants.get(i, set()) if x != ref_char)
+        if use_u:
+            ref_char = 'U' if ref_char.upper() == 'T' else ref_char
+            alts = [('U' if a.upper() == 'T' else a) for a in alts]
+        if alts:
+            buf.append("[" + "/".join([ref_char] + alts) + "]")
+        else:
+            buf.append(ref_char)
+    return "".join(buf)
+
+# =========================
+# Núcleo: normalizar entrada → UniProt → features → BLAST → NT
+# =========================
+def core_pipeline_using_uniprot(target_uniprot: str,
+                                refseq_hint_seq: Optional[str]=None,
+                                mapping_info: Optional[Dict]=None,
+                                extra_prot_ids: Optional[List[str]]=None):
+    """
+    target_uniprot pode ser ACC (P04637) ou isoforma (P04637-2).
+    refseq_hint_seq: sequência de proteína (ex.: da entrada RefSeq) usada para tentar escolher isoforma.
+    extra_prot_ids: lista de protein_ids RefSeq (para ajudar a travar a CDS correta).
+    """
+    # Logs de início (4) uniprot — “não roda/não loga”
+    print(f"[INFO] UniProt {target_uniprot}: iniciando coleta de sequência, features e CDS…")
+
+    entry = fetch_uniprot_json(target_uniprot)
+    seq = uniprot_sequence_from_json(entry)
+    org, taxid = uniprot_taxonomy(entry)
+
+    # Filtro de mesma espécie (AA e NT) + alvo esperado p/ auditoria
+    ensure_blast_same_species_filters_from_taxid(taxid, species=org)
+
+    regs = extract_features_as_regions(entry, len(seq))
+
+    # ===== NOVO: fallback automático para GenPept quando UniProt vier sem features reais =====
+    if CONFIG["regions"].get("fallback_genpept_if_uniprot_featureless", True):
+        only_full_or_empty = (not regs) or all(r.tag == "FULL" for r in regs)
+        if only_full_or_empty:
+            # tentar obter protein_ids RefSeq do próprio UniProt + extras do caller
+            _nuccs_from_up, prot_ids_from_up = extract_nuccore_and_prot_from_uniprot(entry)
+            prot_candidates: List[str] = list(dict.fromkeys((extra_prot_ids or []) + prot_ids_from_up))
+            if prot_candidates:
+                print(f"[INFO] UniProt sem features (ou somente FULL). Tentando fallback GenPept usando {prot_candidates[0]} …")
+                try:
+                    regs_gp = extract_regions_from_genpept_features(prot_candidates[0])
+                    if regs_gp:
+                        regs = regs_gp
+                        print("[OK] Features do GenPept aplicadas como fallback.")
+                except Exception as e:
+                    print(f"[WARN] Fallback GenPept falhou: {e}")
+
+    if not regs:
+        regs = [Region(1, len(seq), "FULL", "FULL")]
+
+    # ===== AA por região (BLASTp → Effatha) =====
+    aa_by_region: List[Tuple[str,int,int,str,str]] = []
+    blast_positions_count = 0
+    if CONFIG["blast"]["enable"]:
+        bp = CONFIG["blast"]["protein"]
+        entrez_q = bp.get("entrez_query")
+        for r in regs:
+            frag = seq[r.start_1based-1:r.end_1based]
+            if CONFIG["output"]["blast_progress"]:
+                dbs_log = bp.get("dbs") or [bp.get("db","nr")]
+                print(f"[BLASTp] {r.tag} ({len(frag)} aa) em {dbs_log} (mesmo taxon via entrez_query={entrez_q})…")
+            try:
+                bp_with_tag = {**bp, "audit_region_tag": r.tag}
+                local_vars = blastp_region_multi(frag, entrez_q, bp_with_tag)
+            except Exception as e:
+                if CONFIG["output"]["blast_progress"]:
+                    print(f"[WARN] BLASTP falhou em {r.tag} {r.start_1based}-{r.end_1based}: {e}")
+                local_vars = {}
+            blast_positions_count += len(local_vars)
+            aa_eff = effatha_aa(seq, r, local_vars)
+            aa_by_region.append((r.tag, r.start_1based, r.end_1based, aa_eff, r.note))
     else:
-        dna_full = naive_reverse_translate(seq)
-        nt_segments = nt_segments_for_regions(regs_for_nt, dna_full)
+        for r in regs:
+            frag = seq[r.start_1based-1:r.end_1based]
+            aa_by_region.append((r.tag, r.start_1based, r.end_1based, frag, r.note))
 
-    # Impressão final — inclui nota no cabeçalho
-    print("\n## DNA/mRNA por região (completo) + AA anotado")
-    aa_index = {(a["tag"], a["start"], a["end"]): a["aa"] for a in aa_by_region}
-    for tag, ds, de, dna_seg, mrna_seg, note in nt_segments:
-        header = f"{tag} {ds}-{de}"
-        if note:
-            header += f" — {note}"
-        print(header)
-        aa_line = aa_index.get((tag, ds, de), "")
-        if aa_line:
-            print(f"AA  : {aa_line}")
-        print(f"DNA : {dna_seg}")
-        print(f"mRNA: {mrna_seg}")
+    # ===== NT por região (CDS real → fatiamento → BLASTn → Effatha) =====
+    nt_segments: List[Tuple[str,int,int,str,str,str]] = []
+    picked_nuccore = None
+    if CONFIG["cds_mapping"]["enable"]:
+        nuccore_cands, prot_ids_from_up = extract_nuccore_and_prot_from_uniprot(entry)
+        extra_from_prot = []
+        for pid in (extra_prot_ids or []):
+            extra_from_prot += elink_protein_to_nuccore_accs(pid)
+        for pid in (prot_ids_from_up or []):
+            extra_from_prot += elink_protein_to_nuccore_accs(pid)
+        nuccore_all = list(dict.fromkeys(nuccore_cands + extra_from_prot))
+        if CONFIG["output"]["blast_progress"]:
+            print(f"[DIAG] nuccore candidatos: {nuccore_all or '—'} ; protein_ids: {(extra_prot_ids or []) + prot_ids_from_up or ['—']}")
 
-    # Contexto para UI/artefatos
-    context = {
-        "mapping": mapping_info or {},
-        "protein": {
-            "accession": refseq_acc,   # no modo NCBI-only mostramos o RefSeq
-            "name": rec.name or "",
-            "organism": org_name,
-            "taxid": taxid,
-            "length": len(seq),
-            "sequence": seq,
-        },
-        "regions": [
-            {"source": r.source, "type": r.type, "start": r.start_1based, "end": r.end_1based, "note": r.note}
-            for r in regs
-        ],
-        "blast": {
-            "windows": len(windows),
-            "filter": (f"txid{taxid}[ORGN]" if (CONFIG['blast'].get('enable', False) and taxid) else "None"),
-            "variant_positions": len({p for p in agg.keys()}),
+        picked_nuccore, cds_nt, _translation, _meta = find_cds_strict(nuccore_all, seq, (extra_prot_ids or []) + prot_ids_from_up)
+        if picked_nuccore and cds_nt:
+            bn = CONFIG["blast"]["nt"]
+            for r in regs:
+                dna = cds_nt[(r.start_1based-1)*3 : r.end_1based*3]
+                mrna = dna.replace("T","U")
+                dna_vars = {}
+                mrna_vars = {}
+                if CONFIG["blast"]["enable"]:
+                    try:
+                        if CONFIG["output"]["blast_progress"]:
+                            print(f"[BLASTn] DNA {r.tag} ({len(dna)} nt) em {bn.get('dna_db','nt')}…")
+                        bn_with_tag = {**bn, "audit_region_tag": r.tag}
+                        dna_vars = blastn_region(dna, bn.get("dna_db","nt"), bn_with_tag, is_mrna=False)
+                    except Exception as e:
+                        if CONFIG["output"]["blast_progress"]:
+                            print(f"[WARN] BLASTN DNA falhou em {r.tag} {r.start_1based}-{r.end_1based}: {e}")
+                    try:
+                        if CONFIG["output"]["blast_progress"]:
+                            print(f"[BLASTn] mRNA {r.tag} ({len(mrna)} nt) em {bn.get('rna_db','refseq_rna')}…")
+                        bn_with_tag = {**bn, "audit_region_tag": r.tag}
+                        mrna_vars = blastn_region(mrna, bn.get("rna_db","refseq_rna"), bn_with_tag, is_mrna=True)
+                    except Exception as e:
+                        if CONFIG["output"]["blast_progress"]:
+                            print(f"[WARN] BLASTN mRNA falhou em {r.tag} {r.start_1based}-{r.end_1based}: {e}")
 
-            "variant_positions_blast": len({p for p in agg.keys()}),
-            "variant_positions_uniprot": 0,
-            "variant_positions_proteins": 0,
-            "variant_positions_filtered": 0,
-        },
-        "layers": {
-            "uniprot_variant_enabled": bool(CONFIG.get("external_layers",{}).get("uniprot_variant",{}).get("enable", False)),
-            "proteins_variation_enabled": bool(CONFIG.get("external_layers",{}).get("variation_api",{}).get("enable", False)),
-            "blast_enabled": bool(CONFIG.get("blast",{}).get("enable", False)),
-        },
-        "aa_regions": aa_by_region,
+                dna_eff  = effatha_nt(dna, dna_vars, use_u=False)
+                mrna_eff = effatha_nt(mrna, mrna_vars, use_u=True)
+                nt_segments.append((r.tag, r.start_1based, r.end_1based, dna_eff, mrna_eff, r.note))
+        else:
+            if CONFIG["output"]["blast_progress"]:
+                print("[DIAG] CDS real não mapeada — NT ficará ausente para estas regiões.")
+
+    # ===== Contexto e artifacts =====
+    protein_meta = {"accession": target_uniprot, "length": len(seq), "organism": org, "taxid": taxid}
+    if mapping_info:
+        protein_meta["mapping"] = mapping_info
+
+    region_cards = []
+    for r in regs:
+        region_cards.append({
+            "tag": r.tag, "start": r.start_1based, "end": r.end_1based, "length": r.length, "note": r.note,
+            "ligand_name": None, "ligand_chebi": None, "ligand_is_metal": None,
+            "pct_var_obs": 0.0, "pct_var_fil": 0.0, "max_af": None, "clin_counts": {},
+            "pos_with_manual_ev": 0, "sift_tol": 0, "sift_del": 0, "poly_benign": 0, "poly_damaging": 0,
+            "has_deletion": False,
+        })
+
+    consolidated = {
+        "regions": [{"tag": r.tag, "start": r.start_1based, "end": r.end_1based} for r in regs],
+        "region_cards": region_cards,
+        "aa_regions": [{"tag": t, "start": s, "end": e, "aa": a} for (t,s,e,a,_) in aa_by_region],
         "aa_regions_obs": [],
         "aa_regions_filtered": [],
         "nt_segments": [
-            {"tag": tag, "start": ds, "end": de, "dna": dna, "mrna": mrna, "note": note}
-            for (tag, ds, de, dna, mrna, note) in nt_segments
+            {"tag": t, "start": s, "end": e, "dna": dna, "mrna": mrna, "note": note}
+            for (t,s,e,dna,mrna,note) in nt_segments
         ],
     }
 
-    report_path = CONFIG["output"]["report_txt"]
-    if report_path:
-        write_report_txt(report_path, context=context)
+    return seq, protein_meta, consolidated
 
-    arts = CONFIG["output"].get("artifacts_dir")
-    if arts:
-        try:
-            with open(os.path.join(arts, "context_summary.json"), "w", encoding="utf-8") as fh:
-                json.dump(context, fh, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-# ----------------------------------------------------------------------------
+# =========================
 # Entradas
-# ----------------------------------------------------------------------------
-def run_from_uniprot(accession: str) -> None:
-    print(f"[INFO] Usando UniProt {accession}…")
-    _core_pipeline_from_uniprot(accession, mapping_info=MAPPING_INFO)
+# =========================
+def run_from_uniprot(uniprot_acc: str):
+    seq, meta, consolidated = core_pipeline_using_uniprot(uniprot_acc)
+    context = {
+        "protein": meta,
+        "layers": {
+            "uniprot_variant_enabled": True,
+            "proteins_variation_enabled": True,
+            "blast_enabled": bool(CONFIG["blast"]["enable"]),
+        },
+        "blast": {
+            "variant_positions_blast": 0,  # contador fino pode ser adicionado se necessário
+            "variant_positions_uniprot": 0,
+            "variant_positions_proteins": 0,
+            "variant_positions_filtered": 0,
+        },
+        **consolidated,
+        # Abas: tudo nasce da visão UniProt; NT (CDS) também fica disponível na aba gene
+        "sources": {
+            "uniprot": consolidated,
+            "pdb": {"regions": [], "region_cards": [], "aa_regions": [], "aa_regions_obs": [], "aa_regions_filtered": [], "nt_segments": []},
+            "ncbi_protein": {"regions": [], "region_cards": [], "aa_regions": [], "aa_regions_obs": [], "aa_regions_filtered": [], "nt_segments": []},
+            "ncbi_gene": {"regions": [], "region_cards": [], "aa_regions": [], "aa_regions_obs": [], "aa_regions_filtered": [], "nt_segments": consolidated["nt_segments"]},
+        }
+    }
+    _write_artifacts_and_context(seq, consolidated["aa_regions"], consolidated["nt_segments"], context)
 
-def run_from_pdb(pdb_id: str) -> None:
-    pdb_id = pdb_id.strip().lower()
-    print(f"Descobrindo UniProt/espécie para PDB {pdb_id} via SIFTS…")
-    maps = fetch_pdb_uniprot_mappings(pdb_id)
+def run_from_pdb(pdb_id: str):
+    pdb = (pdb_id or "").strip()
+    if not pdb:
+        print("[ERRO] PDB vazio.")
+        return
+    print(f"Descobrindo UniProt para PDB {pdb} via SIFTS…")
+    maps = fetch_pdb_uniprot_mappings(pdb)
     if not maps:
-        print("Nenhum mapeamento UniProt encontrado para este PDB.")
+        print("[ERRO] Nenhum mapeamento UniProt encontrado via SIFTS.")
         return
-    seq_cache: Dict[str, str] = {}
-    rev_cache: Dict[str, bool] = {}
-    for m in maps:
-        if m.uniprot_acc not in seq_cache:
-            seq_cache[m.uniprot_acc] = fetch_uniprot_fasta(m.uniprot_acc)
-        if m.uniprot_acc not in rev_cache:
-            meta_tmp = fetch_uniprot_meta(m.uniprot_acc)
-            rev_cache[m.uniprot_acc] = (meta_tmp.get("entryType", "").lower().find("reviewed") >= 0)
-    seq_len_by_acc = {acc: len(seq_cache[acc]) for acc in seq_cache}
-    best = choose_best_mapping(maps, seq_len_by_acc, rev_cache)
-    acc = best.uniprot_acc
-    print(f"Selecionado: UniProt {acc} (cadeia {best.chain})")
-    _core_pipeline_from_uniprot(acc, mapping_info=MAPPING_INFO)
+    best = choose_best_mapping(maps)
+    chosen = best.uniprot_acc
+    print(f"Selecionado UniProt {chosen} (cadeia {best.chain}, cobertura≈{best.coverage:.1%})")
 
-def run_from_ncbi_protein(refseq_acc: str) -> None:
-    global MAPPING_INFO  # <-- declare no topo da função
-    refseq_acc = refseq_acc.strip()
-    print(f"[INFO] Usando NCBI Protein {refseq_acc}…")
+    # setar filtro por taxid (quando disponível) — aplica em AA e NT + auditoria alvo
+    org_tax_entry = fetch_uniprot_json(chosen)
+    _org, _taxid = uniprot_taxonomy(org_tax_entry)
+    ensure_blast_same_species_filters_from_taxid(_taxid, species=_org)
 
-    unp = map_refseq_protein_to_uniprot(refseq_acc)
-    if not unp:
-        print("[WARN] Não foi possível mapear RefSeq→UniProt. Seguindo em modo NCBI-only.")
-        MAPPING_INFO = {
-            "input_source": "ncbi_protein",
-            "input_id": refseq_acc,
-            "resolved_refseq": refseq_acc,
-            "mapped_uniprot": None,
-            "notes": "NCBI-only fallback (sem UniProt)"
+    mapping_info = {"input_source":"pdb","input_id":pdb_id,"mapped_uniprot":chosen,"notes":"SIFTS (PDBe)"}
+    seq, meta, consolidated = core_pipeline_using_uniprot(chosen, mapping_info=mapping_info)
+    context = {
+        "protein": meta,
+        "layers": {
+            "uniprot_variant_enabled": True,
+            "proteins_variation_enabled": True,
+            "blast_enabled": bool(CONFIG["blast"]["enable"]),
+        },
+        "blast": {"variant_positions_blast": 0, "variant_positions_uniprot": 0, "variant_positions_proteins": 0, "variant_positions_filtered": 0},
+        **consolidated,
+        "sources": {
+            "uniprot": consolidated,
+            "pdb": consolidated,  # exibir igual na aba PDB (mesma sequência/regions), anotando mapping em meta
+            "ncbi_protein": {"regions": [], "region_cards": [], "aa_regions": [], "aa_regions_obs": [], "aa_regions_filtered": [], "nt_segments": []},
+            "ncbi_gene": {"regions": [], "region_cards": [], "aa_regions": [], "aa_regions_obs": [], "aa_regions_filtered": [], "nt_segments": consolidated["nt_segments"]},
         }
-        _core_pipeline_from_refseq_only(refseq_acc, mapping_info=MAPPING_INFO)
-        return
-
-    print(f"[INFO] Mapeado para UniProt {unp}")
-    MAPPING_INFO = {
-        "input_source": "ncbi_protein",
-        "input_id": refseq_acc,
-        "resolved_refseq": refseq_acc,
-        "mapped_uniprot": unp,
-        "notes": "mapeado via UniProt (xref/idmapping)"
     }
-    _core_pipeline_from_uniprot(unp, mapping_info=MAPPING_INFO)
+    _write_artifacts_and_context(seq, consolidated["aa_regions"], consolidated["nt_segments"], context)
 
-def run_from_ncbi_gene(gene_cfg: Dict) -> None:
-    global MAPPING_INFO  # <-- declare no topo da função
-    print(f"[INFO] Usando NCBI Gene…")
-
-    gid = None
-    if (gene_cfg.get("id_type") == "entrez") and gene_cfg.get("id"):
-        gid = gene_cfg.get("id")
-    elif (gene_cfg.get("id_type") == "symbol") and gene_cfg.get("symbol") and gene_cfg.get("taxid"):
-        gid = ncbi_symbol_to_geneid(gene_cfg["symbol"], int(gene_cfg["taxid"]))
-    if not gid:
-        print("[ERRO] Gene não resolvido (informe GeneID ou Símbolo+TaxID).")
-        return
-
-    refseqs = ncbi_gene_to_refseq_proteins_by_geneid(gid)
-    if not refseqs:
-        print("[ERRO] Nenhuma proteína RefSeq associada ao gene.")
-        return
-
-    acc = choose_isoform(refseqs, policy=gene_cfg.get("isoform_policy","longest"))
+def run_from_ncbi_protein(refseq_acc: str):
+    acc = (refseq_acc or "").strip()
     if not acc:
-        print("[ERRO] Falha ao escolher isoforma.")
-        return
-    print(f"[INFO] Isoforma escolhida: {acc}")
+        raise ValueError("RefSeq Protein ACC vazio.")
 
-    unp = map_refseq_protein_to_uniprot(acc)
-    if not unp:
-        print("[WARN] Não foi possível mapear isoforma para UniProt. Seguindo em modo NCBI-only.")
-        MAPPING_INFO = {
-            "input_source": "ncbi_gene",
-            "input_id": (gene_cfg.get("id") or gene_cfg.get("symbol")),
-            "resolved_gene": f"GeneID:{gid}",
-            "resolved_refseq": acc,
-            "mapped_uniprot": None,
-            "notes": "gene -> refseq protein (policy) -> NCBI-only fallback"
+    # Sequência da proteína (RefSeq)
+    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+    params = {"db":"protein","id":acc,"rettype":"fasta","retmode":"text"}
+    if NCBI_API_KEY: params["api_key"] = NCBI_API_KEY
+    if NCBI_EMAIL:   params["email"] = NCBI_EMAIL
+    r = _http_retry("GET", url, params=params)
+    refseq_seq = "".join([ln.strip() for ln in r.text.splitlines() if not ln.startswith(">")])
+    if not refseq_seq:
+        raise RuntimeError("Falha ao obter sequência proteica do RefSeq.")
+
+    # NEW: Descobrir taxid/espécie pelo próprio GenPept (mesma espécie em AA e NT mesmo sem UniProt)
+    gp_tax, gp_org = _get_tax_from_genpept(acc)
+    ensure_blast_same_species_filters_from_taxid(gp_tax, species=gp_org)
+
+    # (2A) Mapear RefSeq→UniProt via busca no UniProt (reversa)
+    up_accs = map_refseq_protein_to_uniprot(acc)
+
+    if up_accs:
+        # escolher melhor isoforma/ACC conforme política e dica de sequência
+        up = choose_best_uniprot_isoform(up_accs, isoform_policy="longest", refseq_hint_seq=refseq_seq)
+        # Rodar pipeline UniProt, informando o protein_id RefSeq para travar CDS
+        seq, meta, consolidated = core_pipeline_using_uniprot(
+            up,
+            refseq_hint_seq=refseq_seq,
+            mapping_info={"input_source":"ncbi_protein","input_id":acc,"mapped_uniprot":up},
+            extra_prot_ids=[acc]
+        )
+
+        context = {
+            "protein": meta,
+            "layers": {"uniprot_variant_enabled": True, "proteins_variation_enabled": True, "blast_enabled": bool(CONFIG["blast"]["enable"])},
+            "blast": {"variant_positions_blast": 0, "variant_positions_uniprot": 0, "variant_positions_proteins": 0, "variant_positions_filtered": 0},
+            **consolidated,
+            "sources": {
+                "uniprot": consolidated,                 # regiões funcionais nas abas UniProt e NCBI Protein
+                "pdb": {"regions": [], "region_cards": [], "aa_regions": [], "aa_regions_obs": [], "aa_regions_filtered": [], "nt_segments": []},
+                "ncbi_protein": consolidated,
+                "ncbi_gene": {"regions": [], "region_cards": [], "aa_regions": [], "aa_regions_obs": [], "aa_regions_filtered": [], "nt_segments": consolidated["nt_segments"]},
+            }
         }
-        _core_pipeline_from_refseq_only(acc, mapping_info=MAPPING_INFO)
+        _write_artifacts_and_context(seq, consolidated["aa_regions"], consolidated["nt_segments"], context)
         return
 
-    print(f"[INFO] Mapeado para UniProt {unp}")
-    MAPPING_INFO = {
-        "input_source": "ncbi_gene",
-            "input_id": (gene_cfg.get("id") or gene_cfg.get("symbol")),
-            "resolved_gene": f"GeneID:{gid}",
-            "resolved_refseq": acc,
-            "mapped_uniprot": unp,
-            "notes": "gene -> refseq protein (policy) -> uniprot (xref/idmapping)"
-    }
-    _core_pipeline_from_uniprot(unp, mapping_info=MAPPING_INFO)
+    # (2B) Fallback: extrair features do GenPept quando não há mapeamento UniProt
+    print("[AVISO] Não foi possível mapear RefSeq→UniProt pelo xref. Usando features do GenPept.")
+    regs = extract_regions_from_genpept_features(acc)
+    seq = refseq_seq
 
-# ----------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-
-    p = argparse.ArgumentParser()
-    p.add_argument("--pdb", help="PDB ID (ex.: 5xnl)")
-    p.add_argument("--uniprot", help="UniProt ACC (ex.: P02957)")
-    p.add_argument("--ncbi_protein", help="NCBI RefSeq protein (ex.: NP_000537.3)")
-    p.add_argument("--gene_id", help="NCBI GeneID (ex.: 7157)")
-    p.add_argument("--gene_symbol", help="Gene symbol (ex.: TP53)")
-    p.add_argument("--gene_taxid", help="Gene TaxID (ex.: 9606)")
-    args = p.parse_args()
-
-    source = CONFIG["input"]["source"].lower()
-    if args.pdb:
-        source = "pdb"; CONFIG["input"]["pdb_id"] = args.pdb
-    if args.uniprot:
-        source = "uniprot"; CONFIG["input"]["uniprot_acc"] = args.uniprot
-    if args.ncbi_protein:
-        source = "ncbi_protein"; CONFIG["input"]["ncbi_protein_acc"] = args.ncbi_protein
-    if args.gene_id or args.gene_symbol:
-        source = "ncbi_gene"
-        if args.gene_id:
-            CONFIG["input"]["gene"]["id_type"] = "entrez"
-            CONFIG["input"]["gene"]["id"] = args.gene_id
-        else:
-            CONFIG["input"]["gene"]["id_type"] = "symbol"
-            CONFIG["input"]["gene"]["symbol"] = args.gene_symbol or ""
-            CONFIG["input"]["gene"]["taxid"] = int(args.gene_taxid or "9606")
-
-    if source == "pdb":
-        run_from_pdb(CONFIG["input"]["pdb_id"])
-    elif source == "uniprot":
-        run_from_uniprot(CONFIG["input"]["uniprot_acc"])
-    elif source == "ncbi_protein":
-        run_from_ncbi_protein(CONFIG["input"]["ncbi_protein_acc"])
-    elif source == "ncbi_gene":
-        run_from_ncbi_gene(CONFIG["input"]["gene"])
+    # BLAST AA com logs de progresso
+    aa_by_region = []
+    if CONFIG["blast"]["enable"]:
+        bp = CONFIG["blast"]["protein"]
+        for rgn in regs:
+            frag = seq[rgn.start_1based-1:rgn.end_1based]
+            if CONFIG["output"]["blast_progress"]:
+                dbs_log = bp.get("dbs") or [bp.get("db","nr")]
+                print(f"[BLASTp] {rgn.tag} ({len(frag)} aa) em {dbs_log} (mesmo taxon via entrez_query={bp.get('entrez_query')})…")
+            try:
+                bp_with_tag = {**bp, "audit_region_tag": rgn.tag}
+                local_vars = blastp_region_multi(frag, bp.get("entrez_query"), bp_with_tag)
+            except Exception as e:
+                if CONFIG["output"]["blast_progress"]:
+                    print(f"[WARN] BLASTP falhou: {e}")
+                local_vars = {}
+            aa_by_region.append({"tag":rgn.tag,"start":rgn.start_1based,"end":rgn.end_1based,"aa": effatha_aa(seq, rgn, local_vars)})
     else:
-        raise ValueError("CONFIG['input']['source'] deve ser 'pdb' | 'uniprot' | 'ncbi_protein' | 'ncbi_gene'.")
+        for rgn in regs:
+            frag = seq[rgn.start_1based-1:rgn.end_1based]
+            aa_by_region.append({"tag":rgn.tag,"start":rgn.start_1based,"end":rgn.end_1based,"aa": frag})
+
+    # NT a partir da própria RefSeq protein→nuccore
+    nt_segments = []
+    if CONFIG["cds_mapping"]["enable"]:
+        picked, cds_nt, _t, _m = find_cds_strict(elink_protein_to_nuccore_accs(acc), seq, [acc])
+        if picked and cds_nt:
+            bn = CONFIG["blast"]["nt"]
+            for rgn in regs:
+                dna = cds_nt[(rgn.start_1based-1)*3 : rgn.end_1based*3]
+                mrna = dna.replace("T","U")
+                try:
+                    if CONFIG["blast"]["enable"] and CONFIG["output"]["blast_progress"]:
+                        print(f"[BLASTn] DNA {rgn.tag} ({len(dna)} nt) em {bn.get('dna_db','nt')}…")
+                    bn_with_tag = {**bn, "audit_region_tag": rgn.tag}
+                    dna_vars = blastn_region(dna, bn.get("dna_db","nt"), bn_with_tag, is_mrna=False) if CONFIG["blast"]["enable"] else {}
+                except Exception as e:
+                    dna_vars = {}
+                    print(f"[WARN] BLASTN DNA falhou: {e}")
+                try:
+                    if CONFIG["blast"]["enable"] and CONFIG["output"]["blast_progress"]:
+                        print(f"[BLASTn] mRNA {rgn.tag} ({len(mrna)} nt) em {bn.get('rna_db','refseq_rna')}…")
+                    bn_with_tag = {**bn, "audit_region_tag": rgn.tag}
+                    mrna_vars = blastn_region(mrna, bn.get("rna_db","refseq_rna"), bn_with_tag, is_mrna=True) if CONFIG["blast"]["enable"] else {}
+                except Exception as e:
+                    mrna_vars = {}
+                    print(f"[WARN] BLASTN mRNA falhou: {e}")
+                nt_segments.append({"tag":rgn.tag,"start":rgn.start_1based,"end":rgn.end_1based,
+                                    "dna": effatha_nt(dna, dna_vars, use_u=False),
+                                    "mrna": effatha_nt(mrna, mrna_vars, use_u=True),
+                                    "note": rgn.note})
+
+    meta = {"accession": acc, "length": len(seq), "organism": _EXPECTED_SPECIES or "?", "taxid": _EXPECTED_TAXID}
+    consolidated = {
+        "regions": [{"tag":r.tag,"start":r.start_1based,"end":r.end_1based} for r in regs],
+        "region_cards": [{
+            "tag":r.tag,"start":r.start_1based,"end":r.end_1based,"length":r.length,"note":r.note,
+            "ligand_name":None,"ligand_chebi":None,"ligand_is_metal":None,
+            "pct_var_obs":0.0,"pct_var_fil":0.0,"max_af":None,"clin_counts":{},
+            "pos_with_manual_ev":0,"sift_tol":0,"sift_del":0,"poly_benign":0,"poly_damaging":0,"has_deletion":False
+        } for r in regs],
+        "aa_regions": aa_by_region,
+        "aa_regions_obs": [],
+        "aa_regions_filtered": [],
+        "nt_segments": nt_segments,
+    }
+    context = {
+        "protein": meta,
+        "layers": {"uniprot_variant_enabled": True, "proteins_variation_enabled": True, "blast_enabled": bool(CONFIG["blast"]["enable"])},
+        "blast": {"variant_positions_blast": 0, "variant_positions_uniprot": 0, "variant_positions_proteins": 0, "variant_positions_filtered": 0},
+        **consolidated,
+        "sources": {
+            "uniprot": {"regions": [], "region_cards": [], "aa_regions": [], "aa_regions_obs": [], "aa_regions_filtered": [], "nt_segments": []},
+            "pdb": {"regions": [], "region_cards": [], "aa_regions": [], "aa_regions_obs": [], "aa_regions_filtered": [], "nt_segments": []},
+            "ncbi_protein": consolidated,
+            "ncbi_gene": {"regions": [], "region_cards": [], "aa_regions": [], "aa_regions_obs": [], "aa_regions_filtered": [], "nt_segments": nt_segments},
+        }
+    }
+    _write_artifacts_and_context(seq, consolidated["aa_regions"], consolidated["nt_segments"], context)
+
+def run_from_ncbi_gene(gene_cfg: Dict[str, Any]):
+    id_type = (gene_cfg or {}).get("id_type") or "entrez"
+    taxid = int((gene_cfg or {}).get("taxid") or 9606)
+    gene_id = (gene_cfg or {}).get("id") or ""
+    symbol = (gene_cfg or {}).get("symbol") or ""
+    if id_type == "entrez" and gene_id:
+        q = f"{gene_id}[Gene ID] AND txid{taxid}[Organism]"
+    elif id_type == "symbol" and symbol:
+        q = f"{symbol}[Gene Name] AND txid{taxid}[Organism]"
+    else:
+        raise ValueError("Config de gene inválida.")
+
+    # Buscar RefSeq Proteins do gene
+    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+    p = {"db":"protein","term":q,"retmax":"100","sort":"slen","retmode":"json"}
+    if NCBI_API_KEY: p["api_key"] = NCBI_API_KEY
+    if NCBI_EMAIL:   p["email"] = NCBI_EMAIL
+    r = _http_retry("GET", url, params=p)
+    ids = (r.json().get("esearchresult",{}).get("idlist") or [])
+    if not ids: raise RuntimeError("Nenhum RefSeq Protein encontrado.")
+
+    url2 = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+    p2 = {"db":"protein","id":",".join(ids),"rettype":"acc","retmode":"text"}
+    if NCBI_API_KEY: p2["api_key"] = NCBI_API_KEY
+    if NCBI_EMAIL:   p2["email"] = NCBI_EMAIL
+    r2 = _http_retry("GET", url2, params=p2)
+    accs = [ln.strip() for ln in r2.text.splitlines() if ln.strip()]
+    if not accs: raise RuntimeError("Falha ao obter ACCs de protein.")
+
+    # Escolher a maior isoforma (ou política configurável)
+    refseq_acc = max(accs, key=lambda a: len(a))
+    return run_from_ncbi_protein(refseq_acc)
+
+# =========================
+# Saídas
+# =========================
+def _write_artifacts_and_context(
+    prot_seq: str,
+    aa_regions: List[Dict[str, Any]],
+    nt_segments: List[Dict[str, Any]],
+    context: Dict[str, Any],
+):
+    # report
+    rp = CONFIG["output"]["report_txt"]
+    os.makedirs(os.path.dirname(rp), exist_ok=True)
+    with io.open(rp, "w", encoding="utf-8") as fh:
+        fh.write("# Effatha — Gene & Protein Analyzer (regiões funcionais)\n\n")
+        pmeta = context.get("protein", {})
+        fh.write(f"Proteína: {pmeta.get('accession','?')}\n")
+        fh.write(f"Organismo: {pmeta.get('organism','?')} (taxid={pmeta.get('taxid','?')})\n")
+        fh.write(f"Tamanho (AA): {len(prot_seq)} aa\n\n")
+
+        fh.write("## Aminoácidos por região (sintaxe Effatha)\n")
+        for a in aa_regions:
+            fh.write(f"\n### {a['tag']} {a['start']}-{a['end']}\n")
+            fh.write(a["aa"] + "\n")
+
+        fh.write("\n\n## Segmentos NT (DNA/mRNA; sintaxe Effatha por base)\n")
+        if nt_segments:
+            for s in nt_segments:
+                fh.write(f"\n### {s['tag']} {s['start']}-{s['end']}\n")
+                fh.write("DNA:\n")
+                fh.write(s["dna"] + "\n")
+                fh.write("mRNA:\n")
+                fh.write(s["mrna"] + "\n")
+        else:
+            fh.write("(Sem NT — CDS real não mapeado.)\n")
+
+    # regions.csv (resumo simples)
+    rcsv = CONFIG["output"]["export_regions_csv"]
+    if rcsv:
+        try:
+            os.makedirs(os.path.dirname(rcsv), exist_ok=True)
+            with io.open(rcsv, "w", encoding="utf-8", newline="") as fcsv:
+                w = csv.writer(fcsv)
+                w.writerow(["Tag","Start","End","Length"])
+                for a in aa_regions:
+                    w.writerow([a["tag"], a["start"], a["end"], a["end"]-a["start"]+1])
+        except Exception as e:
+            print(f"[WARN] Falha ao escrever regions.csv: {e}")
+
+    # variants_blast.csv (opcional; placeholder)
+    vcsv = CONFIG["output"]["export_csv"]
+    if vcsv and os.path.basename(vcsv):
+        try:
+            os.makedirs(os.path.dirname(vcsv), exist_ok=True)
+            with io.open(vcsv, "w", encoding="utf-8", newline="") as fcsv:
+                w = csv.writer(fcsv)
+                w.writerow(["level","region_tag","pos","observed_set","source"])
+        except Exception as e:
+            print(f"[WARN] Falha ao escrever variants_blast.csv: {e}")
+
+    # BLAST hits audit CSV (agora com species/same_species)
+    hits_csv = CONFIG["output"].get("blast_hits_csv")
+    if hits_csv:
+        try:
+            os.makedirs(os.path.dirname(hits_csv), exist_ok=True)
+            with io.open(hits_csv, "w", encoding="utf-8", newline="") as fcsv:
+                w = csv.writer(fcsv)
+                w.writerow([
+                    "kind","db","region","accession",
+                    "percent_identity","query_coverage","hsp_query_len",
+                    "species","same_species","definition"
+                ])
+                for rec in (_BLASTP_AUDIT + _BLASTN_AUDIT):
+                    w.writerow([
+                        rec.get("kind"), rec.get("db"), rec.get("region"), rec.get("accession"),
+                        rec.get("percent_identity"), rec.get("query_coverage"), rec.get("hsp_query_len"),
+                        rec.get("species",""), rec.get("same_species",""), rec.get("definition","")
+                    ])
+            if CONFIG["output"].get("blast_progress"):
+                print(f"[OK] BLAST hits salvos em {hits_csv}")
+        except Exception as e:
+            print(f"[WARN] Falha ao escrever blast_hits_csv: {e}")
+
+    # context_summary.json
+    ctx_path = os.path.join(CONFIG["output"]["artifacts_dir"], "context_summary.json")
+    try:
+        os.makedirs(CONFIG["output"]["artifacts_dir"], exist_ok=True)
+        with io.open(ctx_path, "w", encoding="utf-8") as fh:
+            json.dump(context, fh, ensure_ascii=False, indent=2)
+        print(f"[OK] context_summary.json salvo em {ctx_path}")
+    except Exception as e:
+        print(f"[ERRO] Ao salvar context_summary.json: {e}")
+
+# =========================
+# Entrypoint
+# =========================
+if __name__ == "__main__":
+    # Sinalização amigável para NCBI email
+    if not NCBI_EMAIL:
+        print("[AVISO] Defina NCBI_EMAIL para cumprir a política do NCBI.")
+
+    src = (CONFIG["input"]["source"] or "").lower()
+    try:
+        if src == "uniprot":
+            run_from_uniprot(CONFIG["input"]["uniprot_acc"])
+        elif src == "pdb":
+            run_from_pdb(CONFIG["input"]["pdb_id"])
+        elif src == "ncbi_protein":
+            run_from_ncbi_protein(CONFIG["input"]["ncbi_protein_acc"])
+        elif src == "ncbi_gene":
+            run_from_ncbi_gene(CONFIG["input"]["gene"])
+        else:
+            print("Defina CONFIG['input']['source'] para 'uniprot' | 'pdb' | 'ncbi_protein' | 'ncbi_gene'.")
+    except requests.HTTPError as e:
+        print(f"[ERRO HTTP] {e} — URL: {getattr(e.response, 'url', '?')}")
+    except Exception as e:
+        print(f"[ERRO] {e}")
