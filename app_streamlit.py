@@ -1840,7 +1840,7 @@ if st.session_state.get("run_btn"):
         st.warning("Já existe uma execução em andamento.")
     else:
         _start_pipeline_job()
-        st.experimental_rerun()
+        st.rerun()
 
 job = st.session_state.get("__job")
 if job:
