@@ -130,13 +130,19 @@ NCBI_API_KEY = os.getenv("NCBI_API_KEY", "").strip()
 NCBI_EMAIL   = CONFIG.get("ncbi", {}).get("email", NCBI_EMAIL).strip()
 NCBI_API_KEY = CONFIG.get("ncbi", {}).get("api_key", NCBI_API_KEY).strip()
 
-if NCBI_EMAIL:
-    Entrez.email = NCBI_EMAIL
-if NCBI_API_KEY:
-    Entrez.api_key = NCBI_API_KEY
-# Identificação recomendada pelo NCBI (ajuda em rate-limit/contato)
-if not getattr(Entrez, "tool", None):
-    Entrez.tool = "Effatha-GPA"
+ if NCBI_EMAIL:
+     Entrez.email = NCBI_EMAIL
+ if NCBI_API_KEY:
+     Entrez.api_key = NCBI_API_KEY
++# Recomendações do NCBI para identificação da ferramenta
++if not getattr(Entrez, "tool", None):
++    Entrez.tool = "Effatha-GPA"
++# Falha explícita se e-mail não estiver definido (evita respostas HTML/erro do NCBI)
++if not getattr(Entrez, "email", None):
++    raise RuntimeError(
++        "NCBI_EMAIL não definido. Defina a variável de ambiente NCBI_EMAIL "
++        "ou preencha CONFIG['ncbi']['email'] antes de rodar."
++    )
 
 
 SESSION = requests.Session()
@@ -683,31 +689,27 @@ def elink_protein_to_nuccore_accs(prot_acc: str) -> List[str]:
     params = {
         "dbfrom": "protein",
         "db": "nuccore",
-        "id": prot_acc,                 # pode ser accession RefSeq (NP_/XP_/etc)
-        "linkname": "protein_nuccore",  # dica explícita de relacionamento
-        "retmode": "json"
+        "id": prot_acc,
+        "linkname": "protein_nuccore",
+        "retmode": "json",
     }
     if NCBI_API_KEY: params["api_key"] = NCBI_API_KEY
     if NCBI_EMAIL:   params["email"] = NCBI_EMAIL
 
     r = _http_retry("GET", url, params=params)
 
-    # 1) Tenta JSON primeiro (mesmo se o header estiver errado — alguns proxies quebram Content-Type)
     ids: List[str] = []
+    # 1) Tenta JSON primeiro
     try:
         j = r.json()
-        # formato JSON do ELink:
-        # {"linksets": [{"linksetdbs": [{"links": [<uids>]}]}]}
-        linksets = (j.get("linksets") or [])
-        if linksets:
-            for ls in (linksets[0].get("linksetdbs") or []):
-                ids.extend([str(x) for x in (ls.get("links") or [])])
+        for ls in (j.get("linksets") or []):
+            for ldb in (ls.get("linksetdbs") or []):
+                ids.extend([str(x) for x in (ldb.get("links") or [])])
     except Exception:
-        # 2) Fallback: tentar XML
+        # 2) Fallback XML
         try:
             import xml.etree.ElementTree as ET
             root = ET.fromstring(r.content)
-            # XML: eLinkResult/LinkSet/LinkSetDb/Link/Id
             for el in root.findall(".//LinkSetDb/Link/Id"):
                 if el is not None and el.text:
                     ids.append(el.text.strip())
@@ -722,7 +724,7 @@ def elink_protein_to_nuccore_accs(prot_acc: str) -> List[str]:
     if not ids:
         return []
 
-    # 3) Traduz UIDs -> accessions nuccore (rettype=acc)
+    # 3) Converte UIDs para accessions (rettype=acc)
     url2 = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
     p2 = {"db": "nuccore", "id": ",".join(ids), "rettype": "acc", "retmode": "text"}
     if NCBI_API_KEY: p2["api_key"] = NCBI_API_KEY
@@ -730,7 +732,6 @@ def elink_protein_to_nuccore_accs(prot_acc: str) -> List[str]:
 
     r2 = _http_retry("GET", url2, params=p2)
     out = [ln.strip() for ln in r2.text.splitlines() if ln.strip()]
-    # dedup preservando ordem
     return list(dict.fromkeys(out))
 
 def pick_cds_from_genbank(record, prot_seq: str, candidate_protein_ids: List[str]) -> Tuple[Optional[str], Optional[str], Optional[Dict]]:
