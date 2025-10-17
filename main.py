@@ -135,7 +135,7 @@ if NCBI_EMAIL:
 if NCBI_API_KEY:
     Entrez.api_key = NCBI_API_KEY
 # Identificação recomendada pelo NCBI (ajuda em rate-limit/contato)
-if not NCBI_EMAIL:
+if not (NCBI_EMAIL or getattr(Entrez, "email", None)):
     Entrez.tool = "Effatha-GPA"
 # Falha explícita se e-mail não estiver definido (evita respostas HTML/erro do NCBI)
 if not getattr(Entrez, "email", None):
