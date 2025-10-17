@@ -37,7 +37,7 @@ CONFIG: Dict[str, Any] = {
         "ncbi_protein_acc": "AML61188.1",
         "gene": {
             "id_type": "entrez",  # "entrez" | "symbol"
-            "id": "1956",             # ex.: "7157"
+            "id": "1956",         # ex.: "7157"
             "symbol": "",         # ex.: "TP53"
             "taxid": 9606,
             "isoform_policy": "longest",  # usado apenas para entrada "ncbi_gene"
@@ -117,8 +117,8 @@ CONFIG: Dict[str, Any] = {
 
     # (opcional) alternativa para setar credenciais aqui em vez de ENV:
     "ncbi": {
-        # "email": "seu_email@dominio",
-        # "api_key": "sua_chave_aqui"
+        # "email": "lovato.rodrigo@gmail.com",
+        # "api_key": "469b77b82f729a48fd7af84f6fb68bc5d809"
     }
 }
 
@@ -130,24 +130,22 @@ NCBI_API_KEY = os.getenv("NCBI_API_KEY", "").strip()
 NCBI_EMAIL   = CONFIG.get("ncbi", {}).get("email", NCBI_EMAIL).strip()
 NCBI_API_KEY = CONFIG.get("ncbi", {}).get("api_key", NCBI_API_KEY).strip()
 
- if NCBI_EMAIL:
-     Entrez.email = NCBI_EMAIL
- if NCBI_API_KEY:
-     Entrez.api_key = NCBI_API_KEY
-+# Recomendações do NCBI para identificação da ferramenta
-+if not getattr(Entrez, "tool", None):
-+    Entrez.tool = "Effatha-GPA"
-+# Falha explícita se e-mail não estiver definido (evita respostas HTML/erro do NCBI)
-+if not getattr(Entrez, "email", None):
-+    raise RuntimeError(
-+        "NCBI_EMAIL não definido. Defina a variável de ambiente NCBI_EMAIL "
-+        "ou preencha CONFIG['ncbi']['email'] antes de rodar."
-+    )
-
+if NCBI_EMAIL:
+    Entrez.email = NCBI_EMAIL
+if NCBI_API_KEY:
+    Entrez.api_key = NCBI_API_KEY
+# Identificação recomendada pelo NCBI (ajuda em rate-limit/contato)
+if not getattr(Entrez, "tool", None):
+    Entrez.tool = "Effatha-GPA"
+# Falha explícita se e-mail não estiver definido (evita respostas HTML/erro do NCBI)
+if not getattr(Entrez, "email", None):
+    raise RuntimeError(
+        "NCBI_EMAIL não definido. Defina a variável de ambiente NCBI_EMAIL "
+        "ou preencha CONFIG['ncbi']['email'] antes de rodar."
+    )
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "Effatha-GPA/3.0 (+https://effatha)"})
-
 
 def _http_retry(method: str, url: str, **kwargs):
     """GET/POST com backoff (429/5xx)."""
@@ -183,7 +181,6 @@ class Region:
     @property
     def length(self) -> int:
         return self.end_1based - self.start_1based + 1
-
 
 @dataclass
 class PDBUniProtMap:
@@ -424,23 +421,6 @@ def fetch_pdb_uniprot_mappings(pdb_id: str) -> List[PDBUniProtMap]:
     """
     PDBe SIFTS: PDB -> UniProt mapping
     https://www.ebi.ac.uk/pdbe/api/mappings/uniprot/{pdb_id}
-
-    Estrutura (simplificada):
-    {
-      "<pdb_id>": {
-        "UniProt": {
-          "<uniprot_acc>": {
-            "mappings": [
-              {"chain_id": "A", "unp_start": 35, "unp_end": 220, ...},
-              ...
-            ],
-            "sequence_length": 250,
-            ...
-          },
-          ...
-        }
-      }
-    }
     """
     url = f"https://www.ebi.ac.uk/pdbe/api/mappings/uniprot/{pdb_id.lower()}"
     r = _http_retry("GET", url)
@@ -460,7 +440,6 @@ def fetch_pdb_uniprot_mappings(pdb_id: str) -> List[PDBUniProtMap]:
             seq_len = None
 
         for m in (obj.get("mappings") or []):
-            # campos robustos, com fallback
             chain = (m.get("chain_id") or m.get("chain") or "?")
             try:
                 start = int(m.get("unp_start") or 1)
@@ -468,7 +447,6 @@ def fetch_pdb_uniprot_mappings(pdb_id: str) -> List[PDBUniProtMap]:
             except Exception:
                 start, end = 1, 1
 
-            # coverage fornecida pela API ou reconstituída
             cov = m.get("coverage")
             if cov is None:
                 if seq_len and end >= start:
@@ -518,10 +496,7 @@ def extract_nuccore_and_prot_from_uniprot(entry: Dict) -> Tuple[List[str], List[
 # (2) ncbi_protein — fallbacks RefSeq→UniProt e GenPept features
 # =========================
 def _strip_refseq_version(acc: str) -> str:
-    """
-    Remove a versão de um accession RefSeq, se existir.
-    Ex.: NP_123.1 -> NP_123 ; XP_054213393.1 -> XP_054213393
-    """
+    """Remove a versão de um accession RefSeq, se existir. NP_123.1 -> NP_123"""
     try:
         return acc.split('.')[0]
     except Exception:
@@ -530,15 +505,6 @@ def _strip_refseq_version(acc: str) -> str:
 def map_refseq_protein_to_uniprot(ncbi_prot_acc: str) -> List[str]:
     """
     Mapeia RefSeq Protein (NP_/XP_/YP_/WP_/etc) → UniProt ACC(s) de forma robusta.
-    Estratégia (ordem):
-      1) xref direto (com versão e sem versão):   xref:RefSeq:ACC
-      2) busca por base de dados:                 database:RefSeq AND "ACC"
-      3) xref alternativo utilizado em alguns:    xref:RefSeq_Protein:ACC
-      4) Fallback por busca livre (texto):        "ACC" e ACC (com/sem versão)
-         - cobre casos TrEMBL sem xref curado, mas onde o accession aparece no texto/descrição
-    - Nunca levanta exceção por 400/5xx: ignora a tentativa e prossegue.
-    - Retorna lista deduplicada preservando ordem.
-    - Loga consultas tentadas quando não houver resultado e blast_progress=True.
     """
     base = _strip_refseq_version(ncbi_prot_acc)
     tried_queries: List[str] = []
@@ -557,30 +523,28 @@ def map_refseq_protein_to_uniprot(ncbi_prot_acc: str) -> List[str]:
                     out.append(str(acc))
             return out
         except Exception:
-            # qualquer erro (400/5xx/network) -> retorna vazio e segue
             return []
 
     results: List[str] = []
 
-    # ---- (1) xref direto (com e sem versão) ----
+    # (1) xref direto (com/s/versão)
     results += _try_query(f"xref:RefSeq:{ncbi_prot_acc}")
     if not results:
         results += _try_query(f"xref:RefSeq:{base}")
 
-    # ---- (2) database:RefSeq AND "<acc>" (com e sem versão) ----
+    # (2) database:RefSeq AND "<acc>"
     if not results:
         results += _try_query(f'database:RefSeq AND "{ncbi_prot_acc}"')
     if not results:
         results += _try_query(f'database:RefSeq AND "{base}"')
 
-    # ---- (3) xref alternativo RefSeq_Protein (com e sem versão) ----
+    # (3) xref alternativo
     if not results:
         results += _try_query(f"xref:RefSeq_Protein:{ncbi_prot_acc}")
     if not results:
         results += _try_query(f"xref:RefSeq_Protein:{base}")
 
-    # ---- (4) Fallback por busca livre (texto) ----
-    # primeiro com aspas (match mais estrito), depois sem aspas
+    # (4) busca livre
     if not results:
         results += _try_query(f'"{ncbi_prot_acc}"')
     if not results:
@@ -590,20 +554,16 @@ def map_refseq_protein_to_uniprot(ncbi_prot_acc: str) -> List[str]:
     if not results:
         results += _try_query(base)
 
-    # Dedup preservando ordem
     results = list(dict.fromkeys(results))
-
     if not results and CONFIG.get("output", {}).get("blast_progress", False):
-        print(f"[DIAG] UniProt search sem resultados para {ncbi_prot_acc}. Consultas tentadas: {tried_queries}")
-
+        print(f"[DIAG] UniProt search sem resultados para {ncbi_prot_acc}. Consultas: {tried_queries}")
     return results
 
 def extract_regions_from_genpept_features(refseq_prot_acc: str) -> List[Region]:
     """
     Fallback de features a partir do GenPept (db=protein, rettype=gp).
-    Converte as features para Region (somente intervalares; sítios pontuais recebem flanco padrão de 5 aa).
+    Converte as features para Region (intervalares; sítios pontuais recebem flanco padrão de 5 aa).
     """
-    # baixa o registro GenPept
     handle = Entrez.efetch(db="protein", id=refseq_prot_acc, rettype="gp", retmode="text")
     record = SeqIO.read(handle, "genbank")
     handle.close()
@@ -612,41 +572,18 @@ def extract_regions_from_genpept_features(refseq_prot_acc: str) -> List[Region]:
     out: List[Region] = []
     flank = 5
 
-    # mapeamento simples de tipos (GenPept → tags)
     interval_types = {
-        "Region": "REGION",
-        "Site": "SITE",
-        "Domain": "DOMAIN",
-        "Repeat": "REPEAT",
-        "Motif": "MOTIF",
-        "Transmembrane": "TRANSMEMBRANE",
-        "Intramembrane": "INTRAMEMBRANE",
-        "Coiled-coil": "COILED COIL",
-        "Zinc finger": "ZINC FINGER",
-        "Signal peptide": "Signal peptide".upper(),
-        "Transit peptide": "TRANSIT PEPTIDE",
-        "Propeptide": "PROPEPTIDE",
-        "peptide": "PEPTIDE",
-        "Chain": "CHAIN",
-        "Topological domain": "TOPOLOGICAL DOMAIN",
-        "Active site": "ACTIVE SITE",
-        "Metal binding": "METAL BINDING",
-        "Binding site": "BINDING SITE",
-        "Glycosylation": "GLYCOSYLATION SITE",
-        "Lipidation": "LIPIDATION",
-        "Modified residue": "MODIFIED RESIDUE",
-        "Disulfide bond": "DISULFIDE BOND",
-        "Cross-link": "CROSS-LINK",
+        "Region": "REGION", "Site": "SITE", "Domain": "DOMAIN", "Repeat": "REPEAT", "Motif": "MOTIF",
+        "Transmembrane": "TRANSMEMBRANE", "Intramembrane": "INTRAMEMBRANE", "Coiled-coil": "COILED COIL",
+        "Zinc finger": "ZINC FINGER", "Signal peptide": "SIGNAL PEPTIDE", "Transit peptide": "TRANSIT PEPTIDE",
+        "Propeptide": "PROPEPTIDE", "peptide": "PEPTIDE", "Chain": "CHAIN", "Topological domain": "TOPOLOGICAL DOMAIN",
+        "Active site": "ACTIVE SITE", "Metal binding": "METAL BINDING", "Binding site": "BINDING SITE",
+        "Glycosylation": "GLYCOSYLATION SITE", "Lipidation": "LIPIDATION", "Modified residue": "MODIFIED RESIDUE",
+        "Disulfide bond": "DISULFIDE BOND", "Cross-link": "CROSS-LINK",
     }
 
     for feat in record.features:
-        if feat.type not in ("Region", "Site", "Domain", "Repeat", "Motif",
-                             "Transmembrane", "Intramembrane", "Coiled-coil",
-                             "Zinc finger", "Signal peptide", "Transit peptide",
-                             "Propeptide", "peptide", "Chain", "Topological domain",
-                             "Active site", "Metal binding", "Binding site",
-                             "Glycosylation", "Lipidation", "Modified residue",
-                             "Disulfide bond", "Cross-link"):
+        if feat.type not in interval_types:
             continue
 
         tag = interval_types.get(feat.type, feat.type.upper())
@@ -656,7 +593,6 @@ def extract_regions_from_genpept_features(refseq_prot_acc: str) -> List[Region]:
         except Exception:
             pass
 
-        # localização
         try:
             beg = int(feat.location.nofuzzy_start) + 1   # 1-based
             end = int(feat.location.nofuzzy_end)
@@ -664,14 +600,12 @@ def extract_regions_from_genpept_features(refseq_prot_acc: str) -> List[Region]:
             continue
 
         if beg == end:
-            # flanco apenas para sítios pontuais
             beg = max(1, beg - flank)
             end = min(seq_len, end + flank)
 
         if end >= beg and (end - beg + 1) >= int(CONFIG["regions"]["default_min_len"]):
             out.append(Region(beg, end, tag, note))
 
-    # FULL sempre presente
     out.insert(0, Region(1, seq_len, "FULL", "FULL"))
     return out
 
@@ -1075,7 +1009,6 @@ def core_pipeline_using_uniprot(target_uniprot: str,
     refseq_hint_seq: sequência de proteína (ex.: da entrada RefSeq) usada para tentar escolher isoforma.
     extra_prot_ids: lista de protein_ids RefSeq (para ajudar a travar a CDS correta).
     """
-    # Logs de início (4) uniprot — “não roda/não loga”
     print(f"[INFO] UniProt {target_uniprot}: iniciando coleta de sequência, features e CDS…")
 
     entry = fetch_uniprot_json(target_uniprot)
@@ -1087,11 +1020,10 @@ def core_pipeline_using_uniprot(target_uniprot: str,
 
     regs = extract_features_as_regions(entry, len(seq))
 
-    # ===== NOVO: fallback automático para GenPept quando UniProt vier sem features reais =====
+    # ===== Fallback: GenPept quando UniProt vier sem features reais =====
     if CONFIG["regions"].get("fallback_genpept_if_uniprot_featureless", True):
         only_full_or_empty = (not regs) or all(r.tag == "FULL" for r in regs)
         if only_full_or_empty:
-            # tentar obter protein_ids RefSeq do próprio UniProt + extras do caller
             _nuccs_from_up, prot_ids_from_up = extract_nuccore_and_prot_from_uniprot(entry)
             prot_candidates: List[str] = list(dict.fromkeys((extra_prot_ids or []) + prot_ids_from_up))
             if prot_candidates:
@@ -1222,13 +1154,12 @@ def run_from_uniprot(uniprot_acc: str):
             "blast_enabled": bool(CONFIG["blast"]["enable"]),
         },
         "blast": {
-            "variant_positions_blast": 0,  # contador fino pode ser adicionado se necessário
+            "variant_positions_blast": 0,
             "variant_positions_uniprot": 0,
             "variant_positions_proteins": 0,
             "variant_positions_filtered": 0,
         },
         **consolidated,
-        # Abas: tudo nasce da visão UniProt; NT (CDS) também fica disponível na aba gene
         "sources": {
             "uniprot": consolidated,
             "pdb": {"regions": [], "region_cards": [], "aa_regions": [], "aa_regions_obs": [], "aa_regions_filtered": [], "nt_segments": []},
@@ -1252,7 +1183,6 @@ def run_from_pdb(pdb_id: str):
     chosen = best.uniprot_acc
     print(f"Selecionado UniProt {chosen} (cadeia {best.chain}, cobertura≈{best.coverage:.1%})")
 
-    # setar filtro por taxid (quando disponível) — aplica em AA e NT + auditoria alvo
     org_tax_entry = fetch_uniprot_json(chosen)
     _org, _taxid = uniprot_taxonomy(org_tax_entry)
     ensure_blast_same_species_filters_from_taxid(_taxid, species=_org)
@@ -1270,7 +1200,7 @@ def run_from_pdb(pdb_id: str):
         **consolidated,
         "sources": {
             "uniprot": consolidated,
-            "pdb": consolidated,  # exibir igual na aba PDB (mesma sequência/regions), anotando mapping em meta
+            "pdb": consolidated,
             "ncbi_protein": {"regions": [], "region_cards": [], "aa_regions": [], "aa_regions_obs": [], "aa_regions_filtered": [], "nt_segments": []},
             "ncbi_gene": {"regions": [], "region_cards": [], "aa_regions": [], "aa_regions_obs": [], "aa_regions_filtered": [], "nt_segments": consolidated["nt_segments"]},
         }
@@ -1292,17 +1222,15 @@ def run_from_ncbi_protein(refseq_acc: str):
     if not refseq_seq:
         raise RuntimeError("Falha ao obter sequência proteica do RefSeq.")
 
-    # NEW: Descobrir taxid/espécie pelo próprio GenPept (mesma espécie em AA e NT mesmo sem UniProt)
+    # Descobrir taxid/espécie pelo próprio GenPept
     gp_tax, gp_org = _get_tax_from_genpept(acc)
     ensure_blast_same_species_filters_from_taxid(gp_tax, species=gp_org)
 
-    # (2A) Mapear RefSeq→UniProt via busca no UniProt (reversa)
+    # Mapear RefSeq→UniProt (reversa)
     up_accs = map_refseq_protein_to_uniprot(acc)
 
     if up_accs:
-        # escolher melhor isoforma/ACC conforme política e dica de sequência
         up = choose_best_uniprot_isoform(up_accs, isoform_policy="longest", refseq_hint_seq=refseq_seq)
-        # Rodar pipeline UniProt, informando o protein_id RefSeq para travar CDS
         seq, meta, consolidated = core_pipeline_using_uniprot(
             up,
             refseq_hint_seq=refseq_seq,
@@ -1316,7 +1244,7 @@ def run_from_ncbi_protein(refseq_acc: str):
             "blast": {"variant_positions_blast": 0, "variant_positions_uniprot": 0, "variant_positions_proteins": 0, "variant_positions_filtered": 0},
             **consolidated,
             "sources": {
-                "uniprot": consolidated,                 # regiões funcionais nas abas UniProt e NCBI Protein
+                "uniprot": consolidated,
                 "pdb": {"regions": [], "region_cards": [], "aa_regions": [], "aa_regions_obs": [], "aa_regions_filtered": [], "nt_segments": []},
                 "ncbi_protein": consolidated,
                 "ncbi_gene": {"regions": [], "region_cards": [], "aa_regions": [], "aa_regions_obs": [], "aa_regions_filtered": [], "nt_segments": consolidated["nt_segments"]},
@@ -1325,7 +1253,7 @@ def run_from_ncbi_protein(refseq_acc: str):
         _write_artifacts_and_context(seq, consolidated["aa_regions"], consolidated["nt_segments"], context)
         return
 
-    # (2B) Fallback: extrair features do GenPept quando não há mapeamento UniProt
+    # Fallback: features do GenPept quando não há UniProt
     print("[AVISO] Não foi possível mapear RefSeq→UniProt pelo xref. Usando features do GenPept.")
     regs = extract_regions_from_genpept_features(acc)
     seq = refseq_seq
@@ -1422,13 +1350,17 @@ def run_from_ncbi_gene(gene_cfg: Dict[str, Any]):
     else:
         raise ValueError("Config de gene inválida.")
 
-    # Buscar RefSeq Proteins do gene
+    # Buscar RefSeq Proteins do gene (ESearch endurecido p/ JSON)
     url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
     p = {"db":"protein","term":q,"retmax":"100","sort":"slen","retmode":"json"}
     if NCBI_API_KEY: p["api_key"] = NCBI_API_KEY
     if NCBI_EMAIL:   p["email"] = NCBI_EMAIL
     r = _http_retry("GET", url, params=p)
-    ids = (r.json().get("esearchresult",{}).get("idlist") or [])
+    try:
+        j = r.json()
+    except Exception:
+        raise RuntimeError(f"ESearch retornou conteúdo não-JSON. Trecho: {(r.text or '')[:200]}")
+    ids = (j.get("esearchresult",{}).get("idlist") or [])
     if not ids: raise RuntimeError("Nenhum RefSeq Protein encontrado.")
 
     url2 = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
@@ -1539,7 +1471,7 @@ def _write_artifacts_and_context(
 # Entrypoint
 # =========================
 if __name__ == "__main__":
-    # Sinalização amigável para NCBI email
+    # (este aviso só aparece se você remover o raise acima)
     if not NCBI_EMAIL:
         print("[AVISO] Defina NCBI_EMAIL para cumprir a política do NCBI.")
 
