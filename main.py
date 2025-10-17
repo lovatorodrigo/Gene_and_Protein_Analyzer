@@ -117,8 +117,8 @@ CONFIG: Dict[str, Any] = {
 
     # (opcional) alternativa para setar credenciais aqui em vez de ENV:
     "ncbi": {
-        # "email": "lovato.rodrigo@gmail.com",
-        # "api_key": "469b77b82f729a48fd7af84f6fb68bc5d809"
+        "email": "lovato.rodrigo@gmail.com",
+        "api_key": "469b77b82f729a48fd7af84f6fb68bc5d809"
     }
 }
 
