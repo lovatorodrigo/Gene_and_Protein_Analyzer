@@ -1,10 +1,8 @@
 # app_streamlit.py
-# UI (Streamlit) — execução via SUBPROCESS (shim)
+# UI (Streamlit) — execução via SUBPROCESS (assíncrona, com polling) (shim)
 # + Auditoria BLAST, presets, histórico de runs, favoritos, highlight multicor com tooltip,
 #   densidade de colchetes, bundle zip, KPIs por fonte, links rápidos, mapeador proteína→códon,
 #   CATÁLOGO DE PADRÕES (por categorias) + RNAi (siRNA/shRNA) + geração de miRNA seed (7mer/8mer) + GC%.
-#   >>> Atualizado: execução DETACHED (processo solto), heartbeat, polling de live.log,
-#   >>> persistência job.json e reattach automático após queda de sessão.
 
 import os
 import sys
@@ -15,13 +13,29 @@ import shutil
 import zipfile
 import traceback
 import subprocess
+import signal
+import time
 from pathlib import Path
 from datetime import datetime
 
 import streamlit as st
+from streamlit import runtime
+from streamlit.runtime.scriptrunner import add_script_run_ctx
+from streamlit.runtime.scriptrunner.script_run_context import get_script_run_ctx
 
 # ==== Config inicial ====
 st.set_page_config(page_title="Effatha — Functional Regions", layout="wide")
+
+# Wrapper de rerun compatível (Streamlit novo/antigo)
+def _safe_rerun():
+    try:
+        st.rerun()
+    except AttributeError:
+        # compat com versões antigas
+        try:
+            st.experimental_rerun()
+        except Exception:
+            pass
 
 # Optional deps
 try:
@@ -33,76 +47,6 @@ try:
     import matplotlib.pyplot as plt
 except Exception:
     plt = None
-
-# === Helpers de job assíncrono (detached) ===
-import time
-import signal
-import uuid
-from typing import Optional, Dict, Any, List
-
-def _tail_file(path: Path, max_kb: int = 512) -> str:
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            keep = max_kb * 1024
-            start = max(0, size - keep)
-            f.seek(start)
-            data = f.read().decode("utf-8", errors="replace")
-        return data
-    except Exception:
-        return ""
-
-def _proc_is_running(pid: int) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except Exception:
-        return os.path.exists(f"/proc/{pid}")
-
-def _spawn_detached(py_exe: str, script_name: str, cwd: Path) -> int:
-    env = {**os.environ, "PYTHONUTF8":"1","PYTHONIOENCODING":"utf-8","PYTHONUNBUFFERED":"1"}
-    if os.name == "nt":
-        CREATE_NEW_PROCESS_GROUP = 0x00000200
-        DETACHED_PROCESS = 0x00000008
-        p = subprocess.Popen(
-            [py_exe, "-u", script_name],
-            cwd=str(cwd),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
-            env=env,
-            creationflags=CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
-        )
-    else:
-        p = subprocess.Popen(
-            [py_exe, "-u", script_name],
-            cwd=str(cwd),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
-            env=env,
-            preexec_fn=os.setsid
-        )
-    return int(p.pid)
-
-def _cancel_pid(pid: int):
-    if not pid:
-        return
-    try:
-        if os.name == "nt":
-            os.kill(pid, signal.SIGTERM)
-        else:
-            os.killpg(pid, signal.SIGTERM)
-    except Exception:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except Exception:
-            pass
 
 # -------------------------------
 # CSS — wrap visual, multicor e tooltip (alto contraste + fix p/ spans curtos)
@@ -168,6 +112,7 @@ st.markdown(
         font-size: 12px;
         line-height: 1.25;
         z-index: 99999;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.35);
         width: max-content;
         min-width: 220px;
         max-width: min(560px, calc(100vw - 56px));
@@ -211,142 +156,17 @@ def deep_update(d, u):
         else:
             d[k] = v
 
-def write_shim(run_dir, module_path, cfg_overrides):
-    cfg_path = run_dir / "cfg_overrides.json"
-    cfg_path.write_text(json.dumps(cfg_overrides, indent=2, ensure_ascii=False), encoding="utf-8")
+def html_attr(s) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    return (s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;")
+             .replace('"', "&quot;")
+             .replace("'", "&#39;")
+             .replace("\n", "\\n"))
 
-    shim_code = f"""# AUTO-GERADO pelo app Streamlit (não editar)
-import json, sys, importlib.util, pathlib, traceback, threading, time, os
-try:
-    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
-    sys.stderr.reconfigure(encoding="utf-8", line_buffering=True)
-except Exception:
-    pass
-
-class _Tee:
-    def __init__(self, *streams): self.streams = streams
-    def write(self, data):
-        for s in self.streams:
-            try: s.write(data); s.flush()
-            except Exception: pass
-        return len(data)
-    def flush(self):
-        for s in self.streams:
-            try: s.flush()
-            except Exception: pass
-
-_logf = None
-try:
-    _logf = open("live.log", "a", encoding="utf-8")
-    sys.stdout = _Tee(sys.stdout, _logf)
-    sys.stderr = _Tee(sys.stderr, _logf)
-except Exception:
-    pass
-
-_stop_hb = False
-def _hb():
-    while not _stop_hb:
-        try:
-            print(f"[HB {{time.strftime('%H:%M:%S')}}] alive", flush=True)
-        except Exception:
-            pass
-        time.sleep(10)
-threading.Thread(target=_hb, daemon=True).start()
-
-def deep_update(d, u):
-    for k, v in (u or {{}}).items():
-        if isinstance(v, dict) and isinstance(d.get(k), dict):
-            deep_update(d[k], v)
-        else:
-            d[k] = v
-
-module_path = r\"\"\"{Path(module_path).resolve()}\"\"\" 
-spec = importlib.util.spec_from_file_location("pipeline_mod", module_path)
-if spec is None or spec.loader is None:
-    print("FALHA: spec loader None", file=sys.stderr, flush=True)
-    raise RuntimeError("Falha ao carregar spec para o pipeline: " + module_path)
-
-mod = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = mod
-rc = 0
-try:
-    spec.loader.exec_module(mod)
-    with open("cfg_overrides.json", "r", encoding="utf-8") as fh:
-        overrides = json.load(fh)
-    deep_update(mod.CONFIG, overrides)
-
-    src = (mod.CONFIG["input"]["source"] or "").lower()
-    print(f"[INFO] fonte={{src}}", flush=True)
-
-    if src == "uniprot":
-        mod.run_from_uniprot(mod.CONFIG["input"]["uniprot_acc"])
-    elif src == "pdb":
-        mod.run_from_pdb(mod.CONFIG["input"]["pdb_id"])
-    elif src == "ncbi_protein":
-        mod.run_from_ncbi_protein(mod.CONFIG["input"]["ncbi_protein_acc"])
-    elif src == "ncbi_gene":
-        mod.run_from_ncbi_gene(mod.CONFIG["input"]["gene"])
-    else:
-        raise ValueError("CONFIG['input']['source'] deve ser 'pdb' | 'uniprot' | 'ncbi_protein' | 'ncbi_gene'.")
-
-except Exception:
-    rc = 1
-    traceback.print_exc()
-finally:
-    try: open("job.rc","w", encoding="utf-8").write(str(rc))
-    except Exception: pass
-    try: _stop_hb = True
-    except Exception: pass
-    print(f"[DONE] rc={{rc}}", flush=True)
-"""
-    shim_path = run_dir / "shim_run.py"
-    shim_path.write_text(shim_code, encoding="utf-8")
-    return shim_path
-
-def run_subprocess(py_exe, script_path, cwd):
-    env = os.environ.copy()
-    env["PYTHONUTF8"] = "1"
-    env["PYTHONIOENCODING"] = "utf-8"
-    proc = subprocess.run(
-        [py_exe, script_path.name],
-        cwd=str(cwd),
-        text=True,
-        capture_output=True,
-        env=env
-    )
-    return proc.returncode, proc.stdout, proc.stderr
-
-# ---- History & Presets ----
-def list_runs(base_dir="runs", max_items=20):
-    base = Path(base_dir)
-    if not base.exists():
-        return []
-    items = [p for p in base.iterdir() if p.is_dir()]
-    items.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return items[:max_items]
-
-def load_context(run_dir: Path):
-    ctx_path = run_dir / "context_summary.json"
-    if ctx_path.exists():
-        try:
-            return json.loads(ctx_path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-    return None
-
-def build_quick_links(protein_meta: dict):
-    acc = (protein_meta or {}).get("accession") or ""
-    links = []
-    if acc:
-        if re.match(r"^[OPQ][0-9][A-Z0-9]{3}[0-9](-\d+)?$", acc) or re.match(r"^[A-NR-Z]\d{5}(-\d+)?$", acc):
-            links.append(("UniProt", f"https://www.uniprot.org/uniprotkb/{acc}/entry"))
-        if re.match(r"^[NXYWP]P_\d+(?:\.\d+)?$", acc, re.I):
-            links.append(("NCBI Protein", f"https://www.ncbi.nlm.nih.gov/protein/{acc}"))
-    return links
-
-# -------------------------------
-# Busca/realce: suporte multicor + tooltip + catálogo
-# -------------------------------
 def html_escape(s: str) -> str:
     return (s
             .replace("&", "&amp;")
@@ -369,7 +189,175 @@ def revcomp_dna(s: str) -> str:
     comp = {"A":"T","T":"A","G":"C","C":"G"}
     return "".join(comp.get(c,"N") for c in t[::-1])
 
-# Esquema de cores por categoria
+# -------------------------------
+# Job (execução assíncrona do pipeline)
+# -------------------------------
+def write_shim(run_dir: Path, module_path, cfg_overrides):
+    cfg_path = run_dir / "cfg_overrides.json"
+    cfg_path.write_text(json.dumps(cfg_overrides, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    shim_code = f"""# AUTO-GERADO pelo app Streamlit (não editar)
+import json, sys, importlib.util, pathlib, traceback
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+def deep_update(d, u):
+    for k, v in (u or {{}}).items():
+        if isinstance(v, dict) and isinstance(d.get(k), dict):
+            deep_update(d[k], v)
+        else:
+            d[k] = v
+
+module_path = r\"\"\"{Path(module_path).resolve()}\"\"\"
+spec = importlib.util.spec_from_file_location("pipeline_mod", module_path)
+if spec is None or spec.loader is None:
+    raise RuntimeError("Falha ao carregar spec para o pipeline: " + module_path)
+
+mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod
+try:
+    spec.loader.exec_module(mod)
+except Exception:
+    traceback.print_exc()
+    raise
+
+with open("cfg_overrides.json", "r", encoding="utf-8") as fh:
+    overrides = json.load(fh)
+deep_update(mod.CONFIG, overrides)
+
+src = (mod.CONFIG["input"]["source"] or "").lower()
+if src == "uniprot":
+    mod.run_from_uniprot(mod.CONFIG["input"]["uniprot_acc"])
+elif src == "pdb":
+    mod.run_from_pdb(mod.CONFIG["input"]["pdb_id"])
+elif src == "ncbi_protein":
+    mod.run_from_ncbi_protein(mod.CONFIG["input"]["ncbi_protein_acc"])
+elif src == "ncbi_gene":
+    mod.run_from_ncbi_gene(mod.CONFIG["input"]["gene"])
+else:
+    raise ValueError("CONFIG['input']['source'] deve ser 'pdb' | 'uniprot' | 'ncbi_protein' | 'ncbi_gene'.")
+"""
+    shim_path = run_dir / "shim_run.py"
+    shim_path.write_text(shim_code, encoding="utf-8")
+    return shim_path
+
+def _start_pipeline_job(py_exe, shim_path: Path, cwd: Path):
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    stdout_file = cwd / "stdout.log"
+    stderr_file = cwd / "stderr.log"
+    so = open(stdout_file, "w", encoding="utf-8", buffering=1)
+    se = open(stderr_file, "w", encoding="utf-8", buffering=1)
+    proc = subprocess.Popen(
+        [py_exe, shim_path.name],
+        cwd=str(cwd),
+        env=env,
+        stdout=so,
+        stderr=se,
+        text=True,
+        bufsize=1
+    )
+    # guarda controle do job
+    st.session_state["job"] = {
+        "pid": proc.pid,
+        "run_dir": str(cwd),
+        "shim": str(shim_path),
+        "status": "running",
+        "rc": None,
+        "start_ts": time.time(),
+        "stdout": str(stdout_file),
+        "stderr": str(stderr_file),
+    }
+    st.session_state["__proc_pid__"] = proc.pid  # para debug
+    # Não fechamos os arquivos aqui; o Popen é quem escreve. O leitor só lê do disco.
+
+def _poll_job_status():
+    job = st.session_state.get("job")
+    if not job or job.get("status") != "running":
+        return job
+    run_dir = Path(job["run_dir"])
+    pid = job.get("pid")
+    if pid is None:
+        job["status"] = "unknown"
+        st.session_state["job"] = job
+        return job
+    # Checa se processo ainda está vivo
+    alive = True
+    try:
+        os.kill(pid, 0)
+    except Exception:
+        alive = False
+    if not alive:
+        # terminou; tenta achar exit code (não temos Popen) -> heurística: se context_summary existe => rc 0
+        ctx_json = run_dir / "context_summary.json"
+        rc = 0 if ctx_json.exists() else 1
+        job["rc"] = rc
+        job["status"] = "finished"
+        st.session_state["job"] = job
+        return job
+    # ainda rodando
+    return job
+
+def _tail_file(path: Path, max_bytes=100000):
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            if size > max_bytes:
+                fh.seek(-max_bytes, os.SEEK_END)
+            else:
+                fh.seek(0)
+            data = fh.read().decode("utf-8", errors="replace")
+            return data
+    except Exception:
+        return ""
+
+def _cancel_job():
+    job = st.session_state.get("job")
+    if not job:
+        return
+    pid = job.get("pid")
+    try:
+        os.kill(pid, signal.SIGTERM)
+        time.sleep(0.3)
+        # se ainda vivo, força
+        try:
+            os.kill(pid, 0)
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    job["status"] = "canceled"
+    st.session_state["job"] = job
+
+def _load_context_for_last_run(run_dir: Path):
+    ctx_path = run_dir / "context_summary.json"
+    if ctx_path.exists():
+        try:
+            return json.loads(ctx_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    return None
+
+def _sanitize(s: str) -> str:
+    return "".join(ch for ch in (s or "") if ch.isalnum() or ch in ("-", "_", ".")).strip() or "run"
+
+def save_session(run_dir, context, paths, enable_blast, prompt_goal, mech_flags):
+    st.session_state["last_run_dir"] = str(run_dir)
+    st.session_state["last_context"] = context
+    st.session_state["last_paths"] = paths
+    st.session_state["last_enable_blast"] = bool(enable_blast)
+    st.session_state["last_prompt_goal"] = prompt_goal
+    st.session_state["last_mech_flags"] = mech_flags
+
+# -------------------------------
+# Busca/realce: suporte multicor + tooltip + catálogo
+# -------------------------------
 CATEGORY_CLASS = {
     "AA": "hl-aa",
     "NT": "hl-nt",
@@ -379,11 +367,6 @@ CATEGORY_CLASS = {
     "CUSTOM": "hl-custom",
 }
 
-# Catálogo de padrões (por categoria)
-# Cada entrada: dict(
-#   key, label, regex, flags, scope ('AA'|'DNA'|'mRNA'|'NT'), category_tag (p/ cor),
-#   tooltip (str|callable(match_str)->str), priority (int pequeno = maior prioridade)
-# )
 PATTERN_CATALOG = {
     "Nucleotídeos — Microssatélites / repetições": [
         {"key":"NT_AT_GE10_DNA", "label":"[AT]{10,} (DNA)", "regex":r"[AT]{10,}", "flags":re.I, "scope":"DNA", "category_tag":"NT", "tooltip":"Microssatélite AT≥10 (DNA)", "priority":30},
@@ -443,7 +426,6 @@ PATTERN_CATALOG = {
 }
 
 def pattern_specs_for_scope(all_specs, scope_key):
-    """Filtra specs por escopo ('AA', 'DNA', 'mRNA')."""
     out = []
     for sp in all_specs:
         sc = sp.get("scope")
@@ -452,7 +434,6 @@ def pattern_specs_for_scope(all_specs, scope_key):
     return out
 
 def compile_specs(specs):
-    """Compila regex e organiza prioridade."""
     out = []
     for sp in specs:
         try:
@@ -463,30 +444,11 @@ def compile_specs(specs):
     out.sort(key=lambda d: int(d.get("priority", 100)))
     return out
 
-def html_attr(s) -> str:
-    """Escapa string para uso em atributos HTML (ex.: data-title="...")."""
-    if s is None:
-        return ""
-    s = str(s)
-    return (s.replace("&", "&amp;")
-             .replace("<", "&lt;")
-             .replace(">", "&gt;")
-             .replace('"', "&quot;")
-             .replace("'", "&#39;")
-             .replace("\n", "\\n"))
-
 def apply_multi_highlight(text: str, specs, color_override=None):
-    """
-    Realce multicor com tooltip; evita sobrepor matches (primeiro que encaixa ganha).
-    specs: lista de dicts compilados com campos:
-       - _rx (regex), label, category_tag, tooltip (str | callable(match_str)->str)
-    """
     if not text or not specs:
         return f'<div class="mono-pre">{html_escape(text or "")}</div>'
-
     taken = [False] * len(text)
     intervals = []
-
     for sp in specs:
         rx = sp.get("_rx")
         if not rx:
@@ -512,7 +474,6 @@ def apply_multi_highlight(text: str, specs, color_override=None):
             for i in range(s, e):
                 taken[i] = True
             intervals.append((s, e, css_class, tip, lab))
-
     intervals.sort(key=lambda x: x[0])
     out = []
     cur = 0
@@ -524,7 +485,6 @@ def apply_multi_highlight(text: str, specs, color_override=None):
         cur = e
     if cur < len(text):
         out.append(html_escape(text[cur:]))
-
     return f'<div class="mono-pre">{"".join(out)}</div>'
 
 # ---- Densidade de colchetes Effatha ----
@@ -629,9 +589,6 @@ if "last_loaded_run" not in st.session_state:
 with st.sidebar:
     st.header("⚙️ Configurações")
 
-    # Keep-alive: reduz chance de queda por inatividade
-    st.autorefresh(interval=15000, key="__keepalive_sidebar")
-
     # Histórico de runs
     st.subheader("Histórico de execuções")
     base_runs_dir = st.text_input("Pasta de runs", value="runs", key="base_runs_dir")
@@ -649,6 +606,14 @@ with st.sidebar:
     idx_load = st.selectbox("Carregar run anterior", options=["(nenhum)"] + run_labels, index=0)
     if idx_load != "(nenhum)":
         sel = runs[run_labels.index(idx_load)]
+        def load_context(run_dir: Path):
+            ctx_path = run_dir / "context_summary.json"
+            if ctx_path.exists():
+                try:
+                    return json.loads(ctx_path.read_text(encoding="utf-8"))
+                except Exception:
+                    return None
+            return None
         ctx = load_context(sel)
         if ctx:
             st.session_state["last_run_dir"] = str(sel)
@@ -685,11 +650,11 @@ with st.sidebar:
             for k in ("uniprot_acc","pdb_id","ncbi_protein_acc","gene_id","gene_symbol"):
                 if k in st.session_state:
                     st.session_state[k] = ""
-            for k in ("last_run_dir","last_context","last_paths","last_enable_blast","last_loaded_run"):
+            for k in ("last_run_dir","last_context","last_paths","last_enable_blast","last_loaded_run","job"):
                 if k in st.session_state:
                     st.session_state[k] = None
             st.session_state["favorites"] = set()
-            st.rerun()
+            _safe_rerun()
 
     st.text_input("UniProt ACC", value="P02458", key="uniprot_acc")
     st.text_input("PDB ID", value="5xnl", key="pdb_id")
@@ -901,7 +866,6 @@ def render_density_plot(flags, title):
     ax.set_title(title)
     st.pyplot(fig, clear_figure=True)
 
-# ===== BLOCO: Busca & Realce por Padrões =====
 def patterns_ui_block():
     st.subheader("🔎 Busca & marcação por padrões (regex + catálogos)")
     cols = st.columns([1.5, 1.3, 1.2, 1.0])
@@ -1035,7 +999,6 @@ def patterns_ui_block():
     return active_specs, gc_min, gc_max
 
 def seq_block_markdown(label, seq_text, scope, specs_all, gc_min=0.0, gc_max=100.0):
-    """Renderiza bloco com realce multicor e tooltips. 'scope' orienta o filtro de padrões."""
     if not seq_text:
         return
     st.markdown(f"**{label}**")
@@ -1064,7 +1027,6 @@ def seq_block_markdown(label, seq_text, scope, specs_all, gc_min=0.0, gc_max=100
     html = apply_multi_highlight(seq_text, compiled)
     st.markdown(html, unsafe_allow_html=True)
 
-# ---- Mapeador proteína→códon
 STD_CODON_TABLE = {
     'A': ['GCT','GCC','GCA','GCG'],
     'C': ['TGT','TGC'],
@@ -1140,8 +1102,99 @@ def render_codon_mapper(context_like, container):
         if syn:
             st.caption("Códons sinônimos (tabela padrão 1): " + ", ".join(syn))
 
+def _list_regions_lines(context):
+    lines = []
+    for r in context.get("regions", []) or []:
+        note = f" — {r.get('note','')}" if r.get('note') else ""
+        src = r.get('source'); typ = r.get('type'); tag = r.get('tag')
+        if src or typ:
+            lines.append(f"- {src or ''}:{typ or ''} {r.get('start')}-{r.get('end')}{note}")
+        else:
+            lines.append(f"- {tag or ''} {r.get('start')}-{r.get('end')}{note}")
+    return "\n".join(lines) if lines else "(sem regiões)"
+
+def _seq_block(label, seq_text):
+    if not seq_text:
+        return ""
+    return f"**{label}**\n\n```\n{seq_text}\n```\n"
+
+def _render_region_sequences(context):
+    aa_obs = {(a["tag"], a["start"], a["end"]): a["aa"] for a in context.get("aa_regions_obs", [])}
+    aa_fil = {(a["tag"], a["start"], a["end"]): a["aa"] for a in context.get("aa_regions_filtered", [])}
+    aa_any = {(a["tag"], a["start"], a["end"]): a["aa"] for a in context.get("aa_regions", [])}
+
+    blocks = []
+    for seg in context.get("nt_segments", []) or []:
+        tag = seg["tag"]; start = seg["start"]; end = seg["end"]
+        note = seg.get("note") or ""
+        header = f"### {tag} {start}-{end}"
+        if note:
+            header += f" — {note}"
+        aa1 = aa_obs.get((tag,start,end), "")
+        aa2 = aa_fil.get((tag,start,end), "")
+        aa3 = "" if (aa1 or aa2) else aa_any.get((tag,start,end), "")
+        dna = seg.get("dna","")
+        mrna = seg.get("mrna","")
+        section = [header, ""]
+        section.append(_seq_block("AA (observado)", aa1))
+        section.append(_seq_block("AA (filtrado)", aa2))
+        section.append(_seq_block("AA", aa3))
+        section.append(_seq_block("DNA", dna))
+        section.append(_seq_block("mRNA", mrna))
+        blocks.append("\n".join([x for x in section if x]))
+    return "\n\n".join(blocks) if blocks else "_Sem sequências por região disponíveis._"
+
+def write_prompt_file(run_dir, *, context, treatment_goal, mech_flags, report_path, slug, ts):
+    protein = context.get("protein", {}) or {}
+    blast = context.get("blast", {}) or {}
+    layers = context.get("layers", {}) or {}
+
+    md = f"""# Prompt Effatha — Análise e Priorização de Sequências (para GPT Pro)
+
+**Objetivo do tratamento:** {treatment_goal or "(não informado)"}  
+**Mecanismos permitidos nesta análise:** {", ".join([k for k,v in mech_flags.items() if v]) or "aproximar, distanciar e mimetizar"}
+
+## 0) Papel da IA
+Você é uma IA especialista em biologia molecular/sistemas, treinada para avaliar **potencial de intervenção por frequências Effatha** em proteínas/genes.
+
+Para **cada sequência** abaixo:
+1. Classifique o **potencial** Effatha como **"Alto"**, **"Moderado"**, **"Baixo"** ou **"Sem potencial"**.
+2. Indique **qual mecanismo** é mais promissor (**aproximar**, **distanciar**, **mimetizar**) — restrito aos **permitidos** acima.
+3. Explique em **≤ 8 linhas**, citando região/função, contexto estrutural, **variantes por posição** (`[ref/alt/…]`), efeitos esperados e riscos.
+4. Entregue um **ranking global** (Top N) e uma **lista de descarte** (“Sem potencial”) com 1 linha de motivo.
+5. Use **apenas dados reais**; se faltar, retorne **"dado indisponível"** (não inventar).
+
+### Regras de Sintaxe e Processo
+- **Sintaxe Effatha** por **posição** (AA **e** NT): `[A/L/E]` — **NT é por base, não por trinca**.
+- O Analyzer:
+  - Expande regiões com **flancos** (ex.: ±5 aa).
+  - Insere **variantes observadas** (BLAST/UniProt/Proteins Variation) **por posição** no formato Effatha.
+  - Inclui **DNA/mRNA** somente quando há **CDS real mapeado** (sem retrotradução/heurística).
+
+## 1) Contexto do caso
+- **Acesso**: {protein.get('accession','?')}
+- **Organismo**: {protein.get('organism','?')} (taxid={protein.get('taxid','?')})
+- **Tamanho (aa)**: {protein.get('length','?')}
+- **Camadas ativas no Analyzer**:
+  - UniProt VARIANT = { "ON" if layers.get("uniprot_variant_enabled") else "OFF" }
+  - Proteins Variation API = { "ON" if layers.get("proteins_variation_enabled") else "OFF" }
+  - BLAST = { "ON" if layers.get("blast_enabled") else "OFF" }
+- **BLAST (resumo)**: pos_var(blast)={blast.get('variant_positions_blast',0)}
+
+## 2) Regiões-alvo (após expansão)
+{_list_regions_lines(context)}
+
+## 3) Sequências por região (AA + DNA/mRNA)
+{_render_region_sequences(context)}
+"""
+    prompt_md_path = Path(run_dir) / f"prompt_effatha_{slug}_{ts}.md"
+    prompt_txt_path = Path(run_dir) / f"prompt_effatha_{slug}_{ts}.txt"
+    prompt_md_path.write_text(md, encoding="utf-8")
+    prompt_txt_path.write_text(md, encoding="utf-8")
+    return str(prompt_md_path), str(prompt_txt_path)
+
 # -------------------------------
-# Render global
+# Renderers principais
 # -------------------------------
 def render_region_expanders(context_like, container, title=None,
                             show_obs=True, show_fil=True, show_any=True,
@@ -1256,7 +1309,13 @@ def render_outputs(context, paths, enable_blast_flag):
             st.metric("Tamanho (aa)", protein.get("length","?"))
         with colB:
             st.metric("Espécie", f"{protein.get('organism','?')} (taxid={protein.get('taxid','?')})")
-            links = build_quick_links(protein)
+            links = []
+            acc = (protein.get("accession") or "")
+            if acc:
+                if re.match(r"^[OPQ][0-9][A-Z0-9]{3}[0-9](-\d+)?$", acc) or re.match(r"^[A-NR-Z]\d{5}(-\d+)?$", acc):
+                    links.append(("UniProt", f"https://www.uniprot.org/uniprotkb/{acc}/entry"))
+                if re.match(r"^[NXYWP]P_\d+(?:\.\d+)?$", acc, re.I):
+                    links.append(("NCBI Protein", f"https://www.ncbi.nlm.nih.gov/protein/{acc}"))
             if links:
                 st.markdown("Links: " + " | ".join([f"[{n}]({u})" for n,u in links]))
         with colC:
@@ -1282,7 +1341,6 @@ def render_outputs(context, paths, enable_blast_flag):
     kpi_source_box(ncbi_prot_container, srcs.get("ncbi_protein"), "NCBI Protein")
     kpi_source_box(ncbi_gene_container, srcs.get("ncbi_gene"), "NCBI Gene")
 
-    # ----- Regiões (cards)
     cards = context.get("region_cards", []) or []
     with regions_placeholder:
         if not cards or pd is None:
@@ -1311,10 +1369,8 @@ def render_outputs(context, paths, enable_blast_flag):
             df = pd.DataFrame(rows)
             st.dataframe(df, use_container_width=True)
 
-    # ===== Busca & marcação (novo bloco)
     with seqs_container:
         active_specs, gc_min, gc_max = patterns_ui_block()
-
         st.markdown("---")
         st.subheader("Sequências (vista consolidada)")
         cobs, cfil, candy = st.columns(3)
@@ -1362,7 +1418,6 @@ def render_outputs(context, paths, enable_blast_flag):
         with tool_col2:
             st.info("Dica: combine categorias (ex.: RNAi + Promotores) e regex manual para investigações específicas. Passe o mouse nos trechos marcados para ver o tooltip.")
 
-    # ----- Auditoria BLAST
     with blast_audit_container:
         st.subheader("Auditoria BLAST — hits aceitos")
         run_dir = Path(st.session_state.get("last_run_dir") or "")
@@ -1396,7 +1451,6 @@ def render_outputs(context, paths, enable_blast_flag):
                         for c_old, c_new in rename_map.items():
                             if c_old in df_all.columns and c_new not in df_all.columns:
                                 df_all[c_new] = df_all[c_old]
-
                         cols = df_all.columns.tolist()
                         def safe(name): return name if name in cols else None
                         col_region = safe("region_tag")
@@ -1441,7 +1495,6 @@ def render_outputs(context, paths, enable_blast_flag):
                             mime="text/csv"
                         )
 
-    # ----- Downloads
     with downloads_container:
         st.subheader("Downloads")
         try:
@@ -1477,141 +1530,9 @@ def render_outputs(context, paths, enable_blast_flag):
             st.error(f"Erro ao preparar downloads: {e}")
 
 # -------------------------------
-# Prompt Effatha (arquivo) — igual ao anterior (resumo)
+# Execução/pipeline (assíncrona)
 # -------------------------------
-def _list_regions_lines(context):
-    lines = []
-    for r in context.get("regions", []) or []:
-        note = f" — {r.get('note','')}" if r.get('note') else ""
-        src = r.get('source'); typ = r.get('type'); tag = r.get('tag')
-        if src or typ:
-            lines.append(f"- {src or ''}:{typ or ''} {r.get('start')}-{r.get('end')}{note}")
-        else:
-            lines.append(f"- {tag or ''} {r.get('start')}-{r.get('end')}{note}")
-    return "\n".join(lines) if lines else "(sem regiões)"
-
-def _seq_block(label, seq_text):
-    if not seq_text:
-        return ""
-    return f"**{label}**\n\n```\n{seq_text}\n```\n"
-
-def _render_region_sequences(context):
-    aa_obs = {(a["tag"], a["start"], a["end"]): a["aa"] for a in context.get("aa_regions_obs", [])}
-    aa_fil = {(a["tag"], a["start"], a["end"]): a["aa"] for a in context.get("aa_regions_filtered", [])}
-    aa_any = {(a["tag"], a["start"], a["end"]): a["aa"] for a in context.get("aa_regions", [])}
-
-    blocks = []
-    for seg in context.get("nt_segments", []) or []:
-        tag = seg["tag"]; start = seg["start"]; end = seg["end"]
-        note = seg.get("note") or ""
-        header = f"### {tag} {start}-{end}"
-        if note:
-            header += f" — {note}"
-        aa1 = aa_obs.get((tag,start,end), "")
-        aa2 = aa_fil.get((tag,start,end), "")
-        aa3 = "" if (aa1 or aa2) else aa_any.get((tag,start,end), "")
-        dna = seg.get("dna","")
-        mrna = seg.get("mrna","")
-        section = [header, ""]
-        section.append(_seq_block("AA (observado)", aa1))
-        section.append(_seq_block("AA (filtrado)", aa2))
-        section.append(_seq_block("AA", aa3))
-        section.append(_seq_block("DNA", dna))
-        section.append(_seq_block("mRNA", mrna))
-        blocks.append("\n".join([x for x in section if x]))
-    return "\n\n".join(blocks) if blocks else "_Sem sequências por região disponíveis._"
-
-def write_prompt_file(run_dir, *, context, treatment_goal, mech_flags, report_path, slug, ts):
-    protein = context.get("protein", {}) or {}
-    blast = context.get("blast", {}) or {}
-    layers = context.get("layers", {}) or {}
-
-    md = f"""# Prompt Effatha — Análise e Priorização de Sequências (para GPT Pro)
-
-**Objetivo do tratamento:** {treatment_goal or "(não informado)"}  
-**Mecanismos permitidos nesta análise:** {", ".join([k for k,v in mech_flags.items() if v]) or "aproximar, distanciar e mimetizar"}
-
-## 0) Papel da IA
-Você é uma IA especialista em biologia molecular/sistemas, treinada para avaliar **potencial de intervenção por frequências Effatha** em proteínas/genes.
-
-Para **cada sequência** abaixo:
-1. Classifique o **potencial** Effatha como **"Alto"**, **"Moderado"**, **"Baixo"** ou **"Sem potencial"**.
-2. Indique **qual mecanismo** é mais promissor (**aproximar**, **distanciar**, **mimetizar**) — restrito aos **permitidos** acima.
-3. Explique em **≤ 8 linhas**, citando região/função, contexto estrutural, **variantes por posição** (`[ref/alt/…]`), efeitos esperados e riscos.
-4. Entregue um **ranking global** (Top N) e uma **lista de descarte** (“Sem potencial”) com 1 linha de motivo.
-5. Use **apenas dados reais**; se faltar, retorne **"dado indisponível"** (não inventar).
-
-### Regras de Sintaxe e Processo
-- **Sintaxe Effatha** por **posição** (AA **e** NT): `[A/L/E]` — **NT é por base, não por trinca**.
-- O Analyzer:
-  - Expande regiões com **flancos** (ex.: ±5 aa).
-  - Insere **variantes observadas** (BLAST/UniProt/Proteins Variation) **por posição** no formato Effatha.
-  - Inclui **DNA/mRNA** somente quando há **CDS real mapeado** (sem retrotradução/heurística).
-
-## 1) Contexto do caso
-- **Acesso**: {protein.get('accession','?')}
-- **Organismo**: {protein.get('organism','?')} (taxid={protein.get('taxid','?')})
-- **Tamanho (aa)**: {protein.get('length','?')}
-- **Camadas ativas no Analyzer**:
-  - UniProt VARIANT = { "ON" if layers.get("uniprot_variant_enabled") else "OFF" }
-  - Proteins Variation API = { "ON" if layers.get("proteins_variation_enabled") else "OFF" }
-  - BLAST = { "ON" if layers.get("blast_enabled") else "OFF" }
-- **BLAST (resumo)**: pos_var(blast)={blast.get('variant_positions_blast',0)}
-
-## 2) Regiões-alvo (após expansão)
-{_list_regions_lines(context)}
-
-## 3) Sequências por região (AA + DNA/mRNA)
-{_render_region_sequences(context)}
-"""
-    prompt_md_path = Path(run_dir) / f"prompt_effatha_{slug}_{ts}.md"
-    prompt_txt_path = Path(run_dir) / f"prompt_effatha_{slug}_{ts}.txt"
-    prompt_md_path.write_text(md, encoding="utf-8")
-    prompt_txt_path.write_text(md, encoding="utf-8")
-    return str(prompt_md_path), str(prompt_txt_path)
-
-# -------------------------------
-# Execução (compat: função síncrona original ainda existe, mas usaremos detached)
-# -------------------------------
-def _sanitize(s: str) -> str:
-    return "".join(ch for ch in (s or "") if ch.isalnum() or ch in ("-", "_", ".")).strip() or "run"
-
-def save_session(run_dir, context, paths, enable_blast, prompt_goal, mech_flags):
-    st.session_state["last_run_dir"] = str(run_dir)
-    st.session_state["last_context"] = context
-    st.session_state["last_paths"] = paths
-    st.session_state["last_enable_blast"] = bool(enable_blast)
-    st.session_state["last_prompt_goal"] = prompt_goal
-    st.session_state["last_mech_flags"] = mech_flags
-
-# -------------------------------
-# Camada DETACHED: start/persist/reattach/finalize
-# -------------------------------
-def _persist_job(run_dir: Path, job: Dict[str, Any]):
-    (run_dir / "job.json").write_text(json.dumps(job, indent=2, ensure_ascii=False), encoding="utf-8")
-
-def _load_job_from_dir(run_dir: Path) -> Optional[Dict[str, Any]]:
-    p = run_dir / "job.json"
-    if not p.exists(): return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-def _find_latest_active_job(base_dir: Path) -> Optional[Dict[str, Any]]:
-    if not base_dir.exists(): return None
-    dirs = [d for d in base_dir.iterdir() if d.is_dir()]
-    dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    for d in dirs:
-        job = _load_job_from_dir(d)
-        rc_file = d / "job.rc"
-        if job and not rc_file.exists():
-            pid = int(job.get("pid", 0))
-            if _proc_is_running(pid):
-                return job
-    return None
-
-def _start_pipeline_job() -> dict:
+def run_pipeline_background():
     pp = Path(st.session_state["pipeline_path"])
     if not pp.is_file():
         st.error(f"Arquivo não encontrado: {pp}")
@@ -1670,7 +1591,6 @@ def _start_pipeline_job() -> dict:
                 "min_identity": float(st.session_state.get("blast_min_id", 0.97)),
                 "min_query_coverage": float(st.session_state.get("blast_min_cov", 0.95)),
             },
-            "same_species_only": bool(st.session_state.get("blast_same_species_only", True)),
         },
         "variation_filters": {
             "enabled": bool(st.session_state.get("enable_filters", True)),
@@ -1706,150 +1626,124 @@ def _start_pipeline_job() -> dict:
             "blast_progress": True,
         },
     }
+    cfg_overrides["blast"]["same_species_only"] = bool(st.session_state.get("blast_same_species_only", True))
 
     shim_path = write_shim(run_dir, st.session_state["pipeline_path"], cfg_overrides)
-    pid = _spawn_detached(sys.executable, shim_path.name, run_dir)
+    py_exe = sys.executable
+    _start_pipeline_job(py_exe, shim_path, run_dir)
 
-    job = {
-        "job_id": str(uuid.uuid4()),
-        "pid": pid,
-        "run_dir": str(run_dir),
-        "slug": slug,
-        "ts": ts,
-        "report": report_path,
-        "regions_csv": regions_csv_path,
-        "blast_csv": blast_csv_path,
-        "started_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    _persist_job(run_dir, job)
-    st.session_state["__job"] = job
-    return job
-
-def _render_running_job(job: dict):
-    run_dir = Path(job["run_dir"])
-    st.info(f"🏃 Execução em andamento (PID {job['pid']}) — pasta: `{run_dir.name}`")
-    st.autorefresh(interval=2000, key="__poll_refresh")
-    logp = run_dir / "live.log"
-    if logp.exists():
-        log_text = _tail_file(logp, max_kb=512)
-        log_placeholder.code(log_text or "[log vazio]")
-    else:
-        log_placeholder.code("[aguardando live.log…]")
-    c1, c2 = st.columns([1,1])
-    with c1:
-        if st.button("❌ Cancelar execução"):
-            try:
-                _cancel_pid(int(job["pid"]))
-                st.warning("Job cancelado.")
-            except Exception as e:
-                st.error(f"Falha ao cancelar: {e}")
-            st.session_state.pop("__job", None)
-            try: (run_dir/"job.rc").write_text("1", encoding="utf-8")
-            except Exception: pass
-            st.rerun()
-    with c2:
-        st.caption("A UI atualiza automaticamente a cada 2s.")
-
-def _try_finalize_job(job: dict):
-    run_dir = Path(job["run_dir"])
-    rc_file = run_dir / "job.rc"
-    if not rc_file.exists():
-        return False
-    try:
-        rc = int((rc_file.read_text(encoding="utf-8").strip() or "1"))
-    except Exception:
-        rc = 1
-
-    context_path = run_dir / "context_summary.json"
-    context = None
-    if context_path.exists():
-        try:
-            context = json.loads(context_path.read_text(encoding="utf-8"))
-        except Exception as e:
-            tab_resumo.error(f"Falha ao ler context_summary.json: {e}")
-
-    treatment_goal = st.session_state.get("treatment_goal", "").strip()
-    mech_flags = {
-        "aproximar": bool(st.session_state.get("allow_aproximar", True)),
-        "distanciar": bool(st.session_state.get("allow_distanciar", True)),
-        "mimetizar": bool(st.session_state.get("allow_mimetizar", True)),
-    }
-    prompt_md_path = ""
-    prompt_txt_path = ""
-    if context:
-        try:
-            prompt_md_path, prompt_txt_path = write_prompt_file(
-                run_dir,
-                context=context,
-                treatment_goal=treatment_goal,
-                mech_flags=mech_flags,
-                report_path=job.get("report",""),
-                slug=job.get("slug","run"),
-                ts=job.get("ts",""),
-            )
-        except Exception as e:
-            tab_resumo.warning(f"Falha ao gerar Prompt Effatha: {e}")
-
-    paths = {
-        "report": job.get("report",""),
-        "regions_csv": job.get("regions_csv",""),
-        "blast_csv": job.get("blast_csv",""),
-        "prompt_md": (prompt_md_path or ""),
-        "prompt_txt": (prompt_txt_path or ""),
-    }
-
-    try:
-        j = _load_job_from_dir(run_dir) or {}
-        j["finished_at"] = datetime.now().isoformat(timespec="seconds")
-        j["rc"] = rc
-        _persist_job(run_dir, j)
-    except Exception:
-        pass
-
-    save_session(run_dir, context or {}, paths, st.session_state.get("enable_blast", False), treatment_goal, mech_flags)
-
-    st.session_state.pop("__job", None)
-
-    if rc == 0 and context:
-        st.success("Execução concluída.")
-        render_outputs(context, paths, st.session_state.get("last_enable_blast", False))
-    else:
-        st.error(f"Execução finalizada com erro (rc={rc}). Veja 'Logs'.")
-        logp = run_dir / "live.log"
-        if logp.exists():
-            log_text = _tail_file(logp, max_kb=512)
-            log_placeholder.code(log_text or "[log vazio]")
-    return True
-
-def _recover_or_attach_active_job():
-    mem_job = st.session_state.get("__job")
-    if mem_job:
-        return
-    base_dir = Path(st.session_state.get("base_runs_dir") or "runs")
-    job = _find_latest_active_job(base_dir)
-    if job:
-        st.session_state["__job"] = job
+    # muda a UI para a visão "rodando"
+    _safe_rerun()
 
 # -------------------------------
-# Driver
+# Driver principal (com visão de job)
 # -------------------------------
-_recover_or_attach_active_job()
-
+# Botão de execução → inicia job
 if st.session_state.get("run_btn"):
-    if st.session_state.get("__job"):
-        st.warning("Já existe uma execução em andamento.")
-    else:
-        _start_pipeline_job()
-        st.rerun()
+    run_pipeline_background()
 
-job = st.session_state.get("__job")
-if job:
-    pid_ok = _proc_is_running(int(job.get("pid", 0)))
-    if (Path(job["run_dir"]) / "job.rc").exists() or not pid_ok:
-        if not _try_finalize_job(job):
-            _render_running_job(job)
-    else:
-        _render_running_job(job)
+# Se há job em andamento, mostrar status/logs e autorefresh
+job = _poll_job_status()
+
+if job and job.get("status") in ("running", "canceled", "finished", "unknown"):
+    with tab_resumo:
+        st.subheader("Status do processamento")
+        cols = st.columns(4)
+        with cols[0]:
+            st.metric("Status", job.get("status","?"))
+        with cols[1]:
+            st.metric("PID", str(job.get("pid")))
+        with cols[2]:
+            dt = time.time() - float(job.get("start_ts", time.time()))
+            st.metric("Decorridos (s)", f"{dt:.0f}")
+        with cols[3]:
+            run_dir = job.get("run_dir","")
+            st.metric("Run dir", run_dir.split("/")[-1] if run_dir else "—")
+
+        if job.get("status") == "running":
+            c1, c2 = st.columns([1,1])
+            with c1:
+                if st.button("🛑 Cancelar execução", use_container_width=True):
+                    _cancel_job()
+                    _safe_rerun()
+            with c2:
+                st.info("A análise está rodando em background. Esta página atualizará automaticamente.")
+
+        # Logs
+        st.markdown("---")
+        st.subheader("Logs em tempo (tail)")
+        out = _tail_file(Path(job["stdout"]))
+        err = _tail_file(Path(job["stderr"]))
+        log_placeholder.code((out or "") + ("\n" + err if err else ""))
+
+        # Auto-refresh enquanto rodando
+        if job.get("status") == "running":
+            # 2s
+            st_autorefresh = getattr(st, "autorefresh", None)
+            if st_autorefresh is None:
+                # compat antigo
+                from streamlit import experimental_rerun as _exp_rerun  # noqa
+                # usa hack leve de tempo
+                st.caption("Atualizando a cada ~2s…")
+            else:
+                st_autorefresh(interval=2000, key="job_refresh")
+
+    # Se terminou/cancelou, tenta carregar contexto e renderizar
+    if job.get("status") in ("finished", "canceled"):
+        run_dir = Path(job["run_dir"])
+        context = _load_context_for_last_run(run_dir)
+        # caminhos esperados
+        # tenta descobrir últimos arquivos gerados pelo próprio nome
+        guess = {
+            "report": str(next(run_dir.glob("report_*.txt"), run_dir / "report.txt")),
+            "regions_csv": str(next(run_dir.glob("regions_*.csv"), run_dir / "regions.csv")),
+            "blast_csv": str(next(run_dir.glob("variants_blast_*.csv"), "")),
+            "prompt_md": str(next(run_dir.glob("prompt_effatha_*.md"), "")),
+            "prompt_txt": str(next(run_dir.glob("prompt_effatha_*.txt"), "")),
+        }
+        # guarda sessão padrão
+        save_session(
+            run_dir=run_dir,
+            context=(context or {}),
+            paths=guess,
+            enable_blast=st.session_state.get("enable_blast", False),
+            prompt_goal=st.session_state.get("treatment_goal","").strip(),
+            mech_flags={
+                "aproximar": bool(st.session_state.get("allow_aproximar", True)),
+                "distanciar": bool(st.session_state.get("allow_distanciar", True)),
+                "mimetizar": bool(st.session_state.get("allow_mimetizar", True)),
+            }
+        )
+        # Gera prompt se tivermos contexto
+        if context:
+            try:
+                protein = context.get("protein", {}) or {}
+                acc = (protein.get("accession") or "")
+                slug = _sanitize(acc)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                prompt_md_path, prompt_txt_path = write_prompt_file(
+                    run_dir,
+                    context=context,
+                    treatment_goal=st.session_state.get("treatment_goal","").strip(),
+                    mech_flags={
+                        "aproximar": bool(st.session_state.get("allow_aproximar", True)),
+                        "distanciar": bool(st.session_state.get("allow_distanciar", True)),
+                        "mimetizar": bool(st.session_state.get("allow_mimetizar", True)),
+                    },
+                    report_path=guess["report"],
+                    slug=slug or run_dir.name,
+                    ts=ts,
+                )
+                st.session_state["last_paths"]["prompt_md"] = prompt_md_path
+                st.session_state["last_paths"]["prompt_txt"] = prompt_txt_path
+            except Exception as e:
+                tab_resumo.warning(f"Falha ao gerar Prompt Effatha: {e}")
+
+        # Limpa job e rerenderiza para visão normal
+        st.session_state["job"] = None
+        _safe_rerun()
+
+# Se não há job ativo, renderiza último contexto ou placeholder
 elif st.session_state.get("last_context"):
     render_outputs(
         st.session_state.get("last_context"),
@@ -1857,5 +1751,4 @@ elif st.session_state.get("last_context"):
         st.session_state.get("last_enable_blast", False),
     )
 else:
-    st.autorefresh(interval=20000, key="__keepalive_main")
     summary_placeholder.info("Pronto para executar. Configure os parâmetros e clique em **Executar análise**.")
