@@ -19,9 +19,6 @@ from pathlib import Path
 from datetime import datetime
 
 import streamlit as st
-from streamlit import runtime
-from streamlit.runtime.scriptrunner import add_script_run_ctx
-from streamlit.runtime.scriptrunner.script_run_context import get_script_run_ctx
 
 # ==== Config inicial ====
 st.set_page_config(page_title="Effatha — Functional Regions", layout="wide")
@@ -31,11 +28,26 @@ def _safe_rerun():
     try:
         st.rerun()
     except AttributeError:
-        # compat com versões antigas
         try:
             st.experimental_rerun()
         except Exception:
             pass
+
+# Auto-poll/auto-refresh compatível (usa pacote opcional; fallback para sleep+rerun)
+def _auto_poll(interval_ms=2000, key="__auto_poll__"):
+    # 1) tenta pacote externo streamlit-autorefresh (se instalado)
+    try:
+        from streamlit_autorefresh import st_autorefresh  # type: ignore
+        st_autorefresh(interval=interval_ms, key=key)
+        return
+    except Exception:
+        pass
+    # 2) fallback: pequeno sleep e rerun (não bloqueia análise, só este script)
+    try:
+        time.sleep(max(0.2, interval_ms / 1000.0))
+        _safe_rerun()
+    except Exception:
+        pass
 
 # Optional deps
 try:
@@ -261,7 +273,6 @@ def _start_pipeline_job(py_exe, shim_path: Path, cwd: Path):
         text=True,
         bufsize=1
     )
-    # guarda controle do job
     st.session_state["job"] = {
         "pid": proc.pid,
         "run_dir": str(cwd),
@@ -272,8 +283,7 @@ def _start_pipeline_job(py_exe, shim_path: Path, cwd: Path):
         "stdout": str(stdout_file),
         "stderr": str(stderr_file),
     }
-    st.session_state["__proc_pid__"] = proc.pid  # para debug
-    # Não fechamos os arquivos aqui; o Popen é quem escreve. O leitor só lê do disco.
+    st.session_state["__proc_pid__"] = proc.pid
 
 def _poll_job_status():
     job = st.session_state.get("job")
@@ -285,21 +295,18 @@ def _poll_job_status():
         job["status"] = "unknown"
         st.session_state["job"] = job
         return job
-    # Checa se processo ainda está vivo
     alive = True
     try:
         os.kill(pid, 0)
     except Exception:
         alive = False
     if not alive:
-        # terminou; tenta achar exit code (não temos Popen) -> heurística: se context_summary existe => rc 0
         ctx_json = run_dir / "context_summary.json"
         rc = 0 if ctx_json.exists() else 1
         job["rc"] = rc
         job["status"] = "finished"
         st.session_state["job"] = job
         return job
-    # ainda rodando
     return job
 
 def _tail_file(path: Path, max_bytes=100000):
@@ -324,7 +331,6 @@ def _cancel_job():
     try:
         os.kill(pid, signal.SIGTERM)
         time.sleep(0.3)
-        # se ainda vivo, força
         try:
             os.kill(pid, 0)
             os.kill(pid, signal.SIGKILL)
@@ -1443,11 +1449,7 @@ def render_outputs(context, paths, enable_blast_flag):
                         st.info("Não foi possível ler os CSVs de auditoria BLAST.")
                     else:
                         df_all = pd.concat(dfs, ignore_index=True)
-                        rename_map = {
-                            "region":"region_tag",
-                            "percent_identity":"pct_identity",
-                            "sbjct_id":"accession"
-                        }
+                        rename_map = {"region":"region_tag","percent_identity":"pct_identity","sbjct_id":"accession"}
                         for c_old, c_new in rename_map.items():
                             if c_old in df_all.columns and c_new not in df_all.columns:
                                 df_all[c_new] = df_all[c_old]
@@ -1455,7 +1457,6 @@ def render_outputs(context, paths, enable_blast_flag):
                         def safe(name): return name if name in cols else None
                         col_region = safe("region_tag")
                         col_kind = safe("kind")
-                        col_db = safe("db")
                         col_pid = safe("pct_identity")
                         col_qcov = safe("query_coverage")
                         col_acc = safe("accession")
@@ -1632,7 +1633,6 @@ def run_pipeline_background():
     py_exe = sys.executable
     _start_pipeline_job(py_exe, shim_path, run_dir)
 
-    # muda a UI para a visão "rodando"
     _safe_rerun()
 
 # -------------------------------
@@ -1642,7 +1642,7 @@ def run_pipeline_background():
 if st.session_state.get("run_btn"):
     run_pipeline_background()
 
-# Se há job em andamento, mostrar status/logs e autorefresh
+# Se há job em andamento, mostrar status/logs e auto-poll
 job = _poll_job_status()
 
 if job and job.get("status") in ("running", "canceled", "finished", "unknown"):
@@ -1669,31 +1669,21 @@ if job and job.get("status") in ("running", "canceled", "finished", "unknown"):
             with c2:
                 st.info("A análise está rodando em background. Esta página atualizará automaticamente.")
 
-        # Logs
+        # Logs (tail)
         st.markdown("---")
         st.subheader("Logs em tempo (tail)")
         out = _tail_file(Path(job["stdout"]))
         err = _tail_file(Path(job["stderr"]))
         log_placeholder.code((out or "") + ("\n" + err if err else ""))
 
-        # Auto-refresh enquanto rodando
+        # Auto-poll enquanto rodando (compat)
         if job.get("status") == "running":
-            # 2s
-            st_autorefresh = getattr(st, "autorefresh", None)
-            if st_autorefresh is None:
-                # compat antigo
-                from streamlit import experimental_rerun as _exp_rerun  # noqa
-                # usa hack leve de tempo
-                st.caption("Atualizando a cada ~2s…")
-            else:
-                st_autorefresh(interval=2000, key="job_refresh")
+            _auto_poll(2000, key="job_refresh")
 
-    # Se terminou/cancelou, tenta carregar contexto e renderizar
+    # Quando finalizar/cancelar, carregar artefatos e renderizar
     if job.get("status") in ("finished", "canceled"):
         run_dir = Path(job["run_dir"])
         context = _load_context_for_last_run(run_dir)
-        # caminhos esperados
-        # tenta descobrir últimos arquivos gerados pelo próprio nome
         guess = {
             "report": str(next(run_dir.glob("report_*.txt"), run_dir / "report.txt")),
             "regions_csv": str(next(run_dir.glob("regions_*.csv"), run_dir / "regions.csv")),
@@ -1701,7 +1691,6 @@ if job and job.get("status") in ("running", "canceled", "finished", "unknown"):
             "prompt_md": str(next(run_dir.glob("prompt_effatha_*.md"), "")),
             "prompt_txt": str(next(run_dir.glob("prompt_effatha_*.txt"), "")),
         }
-        # guarda sessão padrão
         save_session(
             run_dir=run_dir,
             context=(context or {}),
@@ -1714,7 +1703,6 @@ if job and job.get("status") in ("running", "canceled", "finished", "unknown"):
                 "mimetizar": bool(st.session_state.get("allow_mimetizar", True)),
             }
         )
-        # Gera prompt se tivermos contexto
         if context:
             try:
                 protein = context.get("protein", {}) or {}
@@ -1739,11 +1727,10 @@ if job and job.get("status") in ("running", "canceled", "finished", "unknown"):
             except Exception as e:
                 tab_resumo.warning(f"Falha ao gerar Prompt Effatha: {e}")
 
-        # Limpa job e rerenderiza para visão normal
         st.session_state["job"] = None
         _safe_rerun()
 
-# Se não há job ativo, renderiza último contexto ou placeholder
+# Sem job ativo → renderiza último contexto ou placeholder
 elif st.session_state.get("last_context"):
     render_outputs(
         st.session_state.get("last_context"),
