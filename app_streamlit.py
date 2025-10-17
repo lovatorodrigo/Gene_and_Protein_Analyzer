@@ -151,8 +151,31 @@ def write_shim(run_dir, module_path, cfg_overrides):
     shim_code = f"""# AUTO-GERADO pelo app Streamlit (não editar)
 import json, sys, importlib.util, pathlib, traceback
 try:
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
+    # saída realmente 'line-buffered' p/ stream imediato
+    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
+    sys.stderr.reconfigure(encoding="utf-8", line_buffering=True)
+except Exception:
+    pass
+
+# Tee para gravar também em arquivo (debug pós-mortem)
+class _Tee:
+    def __init__(self, *streams): self.streams = streams
+    def write(self, data):
+        for s in self.streams:
+            try:
+                s.write(data); s.flush()
+            except Exception:
+                pass
+        return len(data)
+    def flush(self):
+        for s in self.streams:
+            try: s.flush()
+            except Exception: pass
+
+try:
+    _logf = open("live.log", "a", encoding="utf-8")
+    sys.stdout = _Tee(sys.stdout, _logf)
+    sys.stderr = _Tee(sys.stderr, _logf)
 except Exception:
     pass
 
@@ -208,6 +231,82 @@ def run_subprocess(py_exe, script_path, cwd):
         env=env
     )
     return proc.returncode, proc.stdout, proc.stderr
+
+# === NOVO: execução com streaming + heartbeat ===
+def run_subprocess_streaming(py_exe, script_path, cwd, on_update, heartbeat_every=8, keep_last_kb=512):
+    """
+    Executa script em subprocess, streamando stdout para on_update(texto_parcial).
+    - heartbeat_every: segundos sem novas linhas até enviar um 'ping' (mantém conexão).
+    - keep_last_kb: mantém apenas os últimos KB do buffer (evita explodir memória da UI).
+    Retorna: (returncode, log_text_final)
+    """
+    import subprocess, os, time
+    from threading import Thread
+    from queue import Queue, Empty
+    from datetime import datetime
+
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"  # crucial p/ flush imediato no filho
+
+    # -u força unbuffered; stderr => stdout
+    proc = subprocess.Popen(
+        [py_exe, "-u", script_path.name],
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+
+    q = Queue(maxsize=10000)
+
+    def _reader(pipe, q_):
+        try:
+            for line in iter(pipe.readline, ''):
+                q_.put(line)
+        finally:
+            try:
+                pipe.close()
+            except Exception:
+                pass
+
+    t = Thread(target=_reader, args=(proc.stdout, q), daemon=True)
+    t.start()
+
+    buf = ""
+    last_emit = time.time()
+
+    def _trim(s: str) -> str:
+        # mantém só os últimos keep_last_kb KB
+        limit = keep_last_kb * 1024
+        return s if len(s.encode("utf-8", errors="ignore")) <= limit else s[-limit:]
+
+    while True:
+        try:
+            line = q.get(timeout=1.0)
+            buf += line
+            buf = _trim(buf)
+            on_update(buf)          # joga log parcial para a UI
+            last_emit = time.time()
+        except Empty:
+            # sem nova linha — manda heartbeat para manter a sessão viva
+            now = time.time()
+            if now - last_emit >= heartbeat_every:
+                hb = f"\n[⏳ {datetime.now().strftime('%H:%M:%S')}] em execução…"
+                buf += hb
+                buf = _trim(buf)
+                on_update(buf)
+                last_emit = now
+
+        # sai quando o processo terminou e o reader drenou stdout
+        if proc.poll() is not None and q.empty():
+            break
+
+    rc = proc.returncode
+    return rc, buf
 
 # ---- History & Presets ----
 def list_runs(base_dir="runs", max_items=20):
@@ -485,11 +584,11 @@ def guess_accession_from_sbjct(s: str):
     if m:
         acc = m.group(1)
         return "uniprot", acc
-    m = re.search(r"(?:^|[|\\s])(NP|XP|YP|WP)_\\d+(?:\\.\\d+)?", s)
+    m = re.search(r"(?:^|[|\s])(NP|XP|YP|WP)_\d+(?:\.\d+)?", s)
     if m:
         acc = m.group(0).strip(" |")
         return "refseq_protein", acc
-    if re.match(r"^[A-NR-Z]\\d{5}(-\\d+)?$", s) or re.match(r"^[OPQ][0-9][A-Z0-9]{3}[0-9](-\\d+)?$", s):
+    if re.match(r"^[A-NR-Z]\d{5}(-\d+)?$", s) or re.match(r"^[OPQ][0-9][A-Z0-9]{3}[0-9](-\d+)?$", s):
         return "uniprot", s
     return None, None
 
@@ -1610,8 +1709,14 @@ def run_pipeline_and_render():
     py_exe = sys.executable
 
     with st.status("Executando pipeline…", expanded=True) as status:
-        rc, out, err = run_subprocess(py_exe, shim_path, run_dir)
-        log_placeholder.code((out or "") + ("\n" + err if err else ""))
+
+        def _push(text):
+            # atualiza a aba "Logs" em tempo real
+            log_placeholder.code(text)
+
+        # === usando execução streaming com heartbeat ===
+        rc, log_text = run_subprocess_streaming(py_exe, shim_path, run_dir, on_update=_push)
+
         if rc == 0:
             status.update(label="Execução concluída", state="complete")
         else:
