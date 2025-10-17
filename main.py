@@ -59,7 +59,7 @@ CONFIG: Dict[str, Any] = {
         "point_flank": 5,         # flancos SOMENTE em features pontuais (±5 aa)
         "default_min_len": 6,     # descarta regiões curtas após aplicar flancos
         "merge_overlaps": True,   # mesclar sobreposições do MESMO tipo
-        "add_full": False,         # adiciona FULL (1..len)
+        "add_full": True,         # adiciona FULL (1..len)
         # NOVO: se o UniProt vier vazio (ou só FULL), tenta features do GenPept automaticamente
         "fallback_genpept_if_uniprot_featureless": True
     },
