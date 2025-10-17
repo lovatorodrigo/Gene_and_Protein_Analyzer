@@ -3,6 +3,7 @@
 # + Auditoria BLAST, presets, histórico de runs, favoritos, highlight multicor com tooltip,
 #   densidade de colchetes, bundle zip, KPIs por fonte, links rápidos, mapeador proteína→códon,
 #   CATÁLOGO DE PADRÕES (por categorias) + RNAi (siRNA/shRNA) + geração de miRNA seed (7mer/8mer) + GC%.
+#   >>> Atualizado: execução DETACHED (processo solto), heartbeat e polling de live.log
 
 import os
 import sys
@@ -32,6 +33,74 @@ try:
 except Exception:
     plt = None
 
+# === Helpers de job assíncrono (detached) ===
+import time
+import signal
+
+def _tail_file(path: Path, max_kb: int = 512) -> str:
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            keep = max_kb * 1024
+            start = max(0, size - keep)
+            f.seek(start)
+            data = f.read().decode("utf-8", errors="replace")
+        return data
+    except Exception:
+        return ""
+
+def _proc_is_running(pid: int) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)  # sinal 0 = apenas checar
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        # Fallback Linux
+        return os.path.exists(f"/proc/{pid}")
+
+def _spawn_detached(py_exe: str, script_name: str, cwd: Path) -> int:
+    if os.name == "nt":
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        DETACHED_PROCESS = 0x00000008
+        p = subprocess.Popen(
+            [py_exe, "-u", script_name],
+            cwd=str(cwd),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "PYTHONUTF8":"1","PYTHONIOENCODING":"utf-8","PYTHONUNBUFFERED":"1"},
+            creationflags=CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
+        )
+    else:
+        p = subprocess.Popen(
+            [py_exe, "-u", script_name],
+            cwd=str(cwd),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "PYTHONUTF8":"1","PYTHONIOENCODING":"utf-8","PYTHONUNBUFFERED":"1"},
+            preexec_fn=os.setsid  # nova sessão → não cai com o Streamlit
+        )
+    return int(p.pid)
+
+def _cancel_pid(pid: int):
+    if not pid:
+        return
+    try:
+        if os.name == "nt":
+            os.kill(pid, signal.SIGTERM)
+        else:
+            os.killpg(pid, signal.SIGTERM)
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+
 # -------------------------------
 # CSS — wrap visual, multicor e tooltip (alto contraste + fix p/ spans curtos)
 # -------------------------------
@@ -56,11 +125,10 @@ st.markdown(
         border-radius: 6px;
         padding: 10px;
         background: #ffffff;
-        overflow: visible;              /* evita clip de tooltip */
+        overflow: visible;
         position: relative;
     }
 
-    /* Badges/KPIs */
     .hl { background: #fff2a8; padding: 0 1px; border-radius: 2px; }
     .badge { display:inline-block; padding:1px 6px; border-radius: 10px; font-size: 11px; margin-right: 6px; }
     .badge.full { background:#e7f1ff; }
@@ -69,7 +137,6 @@ st.markdown(
     .badge.lig { background:#ffe6f2; }
     .kpibox { background:#f7f7f9; padding:10px; border-radius:8px; border:1px solid #eee; margin-bottom:8px;}
 
-    /* Highlights (alto contraste) */
     .hl-tip {
         position: relative;
         cursor: help;
@@ -85,7 +152,6 @@ st.markdown(
     .hl-motif { background:#FF7043; color:#311000; border-bottom:2px solid #E64A19; }
     .hl-custom{ background:#FFD54F; color:#332400; border-bottom:2px solid #FFA000; }
 
-    /* Tooltip centralizado, com largura mínima (fix p/ matches curtos) */
     .hl-tip:hover::after {
         content: attr(data-title);
         position: absolute;
@@ -100,11 +166,10 @@ st.markdown(
         line-height: 1.25;
         z-index: 99999;
         box-shadow: 0 4px 12px rgba(0,0,0,0.35);
-        /* >>> as três linhas abaixo resolvem o “efeito coluna” */
-        width: max-content;                                  /* usa largura do conteúdo */
-        min-width: 220px;                                     /* nunca fica estreito */
-        max-width: min(560px, calc(100vw - 56px));            /* não passa da viewport */
-        white-space: pre-wrap;                                /* quebra em espaços/\\n */
+        width: max-content;
+        min-width: 220px;
+        max-width: min(560px, calc(100vw - 56px));
+        white-space: pre-wrap;
         text-align: left;
         pointer-events: none;
     }
@@ -149,35 +214,42 @@ def write_shim(run_dir, module_path, cfg_overrides):
     cfg_path.write_text(json.dumps(cfg_overrides, indent=2, ensure_ascii=False), encoding="utf-8")
 
     shim_code = f"""# AUTO-GERADO pelo app Streamlit (não editar)
-import json, sys, importlib.util, pathlib, traceback
+import json, sys, importlib.util, pathlib, traceback, threading, time, os
 try:
-    # saída realmente 'line-buffered' p/ stream imediato
     sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
     sys.stderr.reconfigure(encoding="utf-8", line_buffering=True)
 except Exception:
     pass
 
-# Tee para gravar também em arquivo (debug pós-mortem)
 class _Tee:
     def __init__(self, *streams): self.streams = streams
     def write(self, data):
         for s in self.streams:
-            try:
-                s.write(data); s.flush()
-            except Exception:
-                pass
+            try: s.write(data); s.flush()
+            except Exception: pass
         return len(data)
     def flush(self):
         for s in self.streams:
             try: s.flush()
             except Exception: pass
 
+_logf = None
 try:
     _logf = open("live.log", "a", encoding="utf-8")
     sys.stdout = _Tee(sys.stdout, _logf)
     sys.stderr = _Tee(sys.stderr, _logf)
 except Exception:
     pass
+
+_stop_hb = False
+def _hb():
+    while not _stop_hb:
+        try:
+            print(f"[HB {{time.strftime('%H:%M:%S')}}] alive", flush=True)
+        except Exception:
+            pass
+        time.sleep(10)
+threading.Thread(target=_hb, daemon=True).start()
 
 def deep_update(d, u):
     for k, v in (u or {{}}).items():
@@ -189,31 +261,45 @@ def deep_update(d, u):
 module_path = r\"\"\"{Path(module_path).resolve()}\"\"\" 
 spec = importlib.util.spec_from_file_location("pipeline_mod", module_path)
 if spec is None or spec.loader is None:
+    print("FALHA: spec loader None", file=sys.stderr, flush=True)
     raise RuntimeError("Falha ao carregar spec para o pipeline: " + module_path)
 
 mod = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = mod  # importante p/ dataclasses/typing
+sys.modules[spec.name] = mod
+rc = 0
 try:
-    spec.loader.exec_module(mod)  # executa o main.py
-except Exception:
+    spec.loader.exec_module(mod)
+    with open("cfg_overrides.json", "r", encoding="utf-8") as fh:
+        overrides = json.load(fh)
+    deep_update(mod.CONFIG, overrides)
+
+    src = (mod.CONFIG["input"]["source"] or "").lower()
+    print(f"[INFO] fonte={{src}}", flush=True)
+
+    if src == "uniprot":
+        mod.run_from_uniprot(mod.CONFIG["input"]["uniprot_acc"])
+    elif src == "pdb":
+        mod.run_from_pdb(mod.CONFIG["input"]["pdb_id"])
+    elif src == "ncbi_protein":
+        mod.run_from_ncbi_protein(mod.CONFIG["input"]["ncbi_protein_acc"])
+    elif src == "ncbi_gene":
+        mod.run_from_ncbi_gene(mod.CONFIG["input"]["gene"])
+    else:
+        raise ValueError("CONFIG['input']['source'] deve ser 'pdb' | 'uniprot' | 'ncbi_protein' | 'ncbi_gene'.")
+
+except Exception as e:
+    rc = 1
     traceback.print_exc()
-    raise
-
-with open("cfg_overrides.json", "r", encoding="utf-8") as fh:
-    overrides = json.load(fh)
-deep_update(mod.CONFIG, overrides)
-
-src = (mod.CONFIG["input"]["source"] or "").lower()
-if src == "uniprot":
-    mod.run_from_uniprot(mod.CONFIG["input"]["uniprot_acc"])
-elif src == "pdb":
-    mod.run_from_pdb(mod.CONFIG["input"]["pdb_id"])
-elif src == "ncbi_protein":
-    mod.run_from_ncbi_protein(mod.CONFIG["input"]["ncbi_protein_acc"])
-elif src == "ncbi_gene":
-    mod.run_from_ncbi_gene(mod.CONFIG["input"]["gene"])
-else:
-    raise ValueError("CONFIG['input']['source'] deve ser 'pdb' | 'uniprot' | 'ncbi_protein' | 'ncbi_gene'.")
+finally:
+    try:
+        open("job.rc","w", encoding="utf-8").write(str(rc))
+    except Exception:
+        pass
+    try:
+        _stop_hb = True
+    except Exception:
+        pass
+    print(f"[DONE] rc={{rc}}", flush=True)
 """
     shim_path = run_dir / "shim_run.py"
     shim_path.write_text(shim_code, encoding="utf-8")
@@ -231,82 +317,6 @@ def run_subprocess(py_exe, script_path, cwd):
         env=env
     )
     return proc.returncode, proc.stdout, proc.stderr
-
-# === NOVO: execução com streaming + heartbeat ===
-def run_subprocess_streaming(py_exe, script_path, cwd, on_update, heartbeat_every=8, keep_last_kb=512):
-    """
-    Executa script em subprocess, streamando stdout para on_update(texto_parcial).
-    - heartbeat_every: segundos sem novas linhas até enviar um 'ping' (mantém conexão).
-    - keep_last_kb: mantém apenas os últimos KB do buffer (evita explodir memória da UI).
-    Retorna: (returncode, log_text_final)
-    """
-    import subprocess, os, time
-    from threading import Thread
-    from queue import Queue, Empty
-    from datetime import datetime
-
-    env = os.environ.copy()
-    env["PYTHONUTF8"] = "1"
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUNBUFFERED"] = "1"  # crucial p/ flush imediato no filho
-
-    # -u força unbuffered; stderr => stdout
-    proc = subprocess.Popen(
-        [py_exe, "-u", script_path.name],
-        cwd=str(cwd),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env=env,
-    )
-
-    q = Queue(maxsize=10000)
-
-    def _reader(pipe, q_):
-        try:
-            for line in iter(pipe.readline, ''):
-                q_.put(line)
-        finally:
-            try:
-                pipe.close()
-            except Exception:
-                pass
-
-    t = Thread(target=_reader, args=(proc.stdout, q), daemon=True)
-    t.start()
-
-    buf = ""
-    last_emit = time.time()
-
-    def _trim(s: str) -> str:
-        # mantém só os últimos keep_last_kb KB
-        limit = keep_last_kb * 1024
-        return s if len(s.encode("utf-8", errors="ignore")) <= limit else s[-limit:]
-
-    while True:
-        try:
-            line = q.get(timeout=1.0)
-            buf += line
-            buf = _trim(buf)
-            on_update(buf)          # joga log parcial para a UI
-            last_emit = time.time()
-        except Empty:
-            # sem nova linha — manda heartbeat para manter a sessão viva
-            now = time.time()
-            if now - last_emit >= heartbeat_every:
-                hb = f"\n[⏳ {datetime.now().strftime('%H:%M:%S')}] em execução…"
-                buf += hb
-                buf = _trim(buf)
-                on_update(buf)
-                last_emit = now
-
-        # sai quando o processo terminou e o reader drenou stdout
-        if proc.poll() is not None and q.empty():
-            break
-
-    rc = proc.returncode
-    return rc, buf
 
 # ---- History & Presets ----
 def list_runs(base_dir="runs", max_items=20):
@@ -330,10 +340,8 @@ def build_quick_links(protein_meta: dict):
     acc = (protein_meta or {}).get("accession") or ""
     links = []
     if acc:
-        # UniProt ACC
         if re.match(r"^[OPQ][0-9][A-Z0-9]{3}[0-9](-\d+)?$", acc) or re.match(r"^[A-NR-Z]\d{5}(-\d+)?$", acc):
             links.append(("UniProt", f"https://www.uniprot.org/uniprotkb/{acc}/entry"))
-        # RefSeq Protein ACC
         if re.match(r"^[NXYWP]P_\d+(?:\.\d+)?$", acc, re.I):
             links.append(("NCBI Protein", f"https://www.ncbi.nlm.nih.gov/protein/{acc}"))
     return links
@@ -363,7 +371,6 @@ def revcomp_dna(s: str) -> str:
     comp = {"A":"T","T":"A","G":"C","C":"G"}
     return "".join(comp.get(c,"N") for c in t[::-1])
 
-# Esquema de cores por categoria
 CATEGORY_CLASS = {
     "AA": "hl-aa",
     "NT": "hl-nt",
@@ -373,11 +380,6 @@ CATEGORY_CLASS = {
     "CUSTOM": "hl-custom",
 }
 
-# Catálogo de padrões (por categoria)
-# Cada entrada: dict(
-#   key, label, regex, flags, scope ('AA'|'DNA'|'mRNA'|'NT'), category_tag (p/ cor),
-#   tooltip (str|callable(match_str)->str), priority (int pequeno = maior prioridade)
-# )
 PATTERN_CATALOG = {
     "Nucleotídeos — Microssatélites / repetições": [
         {"key":"NT_AT_GE10_DNA", "label":"[AT]{10,} (DNA)", "regex":r"[AT]{10,}", "flags":re.I, "scope":"DNA", "category_tag":"NT", "tooltip":"Microssatélite AT≥10 (DNA)", "priority":30},
@@ -396,7 +398,6 @@ PATTERN_CATALOG = {
         {"key":"NT_GC_BOX","label":"GC box (SP1)","regex":r"GGGCGG","flags":re.I,"scope":"DNA","category_tag":"PROM","tooltip":"GC box (SP1) (DNA)","priority":70},
     ],
     "RNAi (siRNA/shRNA)": [
-        # siRNA candidatos (DNA/mRNA) com GC% no núcleo de 19nt
         {
             "key":"RNAI_SIRNA_DNA_AA_N19_TT",
             "label":"siRNA DNA: AA[ACGT]{19}TT",
@@ -417,7 +418,6 @@ PATTERN_CATALOG = {
             "tooltip":lambda s: f"RNAi candidato (mRNA) — núcleo 19nt GC={gc_percent(s[2:-2]):.1f}%",
             "priority":10
         },
-        # shRNA loop e terminadores
         {"key":"RNAI_SHRNA_LOOP_DNA","label":"Loop shRNA (DNA) TTCAAGAGA","regex":r"TTCAAGAGA","flags":0,"scope":"DNA","category_tag":"RNAi","tooltip":"Loop shRNA (DNA) TTCAAGAGA","priority":20},
         {"key":"RNAI_SHRNA_LOOP_mRNA","label":"Loop shRNA (mRNA) UUCAAGAGA","regex":r"UUCAAGAGA","flags":0,"scope":"mRNA","category_tag":"RNAi","tooltip":"Loop shRNA (mRNA) UUCAAGAGA","priority":20},
         {"key":"RNAI_POLIII_TERM_DNA","label":"Pol III terminator T{4,}","regex":r"T{4,}","flags":0,"scope":"DNA","category_tag":"RNAi","tooltip":"Pol III terminator — evitar em hairpin (DNA)","priority":25},
@@ -439,7 +439,6 @@ PATTERN_CATALOG = {
 }
 
 def pattern_specs_for_scope(all_specs, scope_key):
-    """Filtra specs por escopo ('AA', 'DNA', 'mRNA')."""
     out = []
     for sp in all_specs:
         sc = sp.get("scope")
@@ -448,30 +447,33 @@ def pattern_specs_for_scope(all_specs, scope_key):
     return out
 
 def compile_specs(specs):
-    """Compila regex e organiza prioridade."""
     out = []
     for sp in specs:
         try:
             rx = re.compile(sp["regex"], sp.get("flags", 0))
             out.append({**sp, "_rx": rx})
         except Exception:
-            # ignora padrão inválido
             continue
     out.sort(key=lambda d: int(d.get("priority", 100)))
     return out
 
+def html_attr(s) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    return (s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;")
+             .replace('"', "&quot;")
+             .replace("'", "&#39;")
+             .replace("\n", "\\n"))
+
 def apply_multi_highlight(text: str, specs, color_override=None):
-    """
-    Realce multicor com tooltip; evita sobrepor matches (primeiro que encaixa ganha).
-    specs: lista de dicts compilados com campos:
-       - _rx (regex), label, category_tag, tooltip (str | callable(match_str)->str)
-    """
     if not text or not specs:
         return f'<div class="mono-pre">{html_escape(text or "")}</div>'
 
-    # Vamos marcar índices ocupados para evitar overlap
     taken = [False] * len(text)
-    intervals = []  # (start, end, class, tooltip, label)
+    intervals = []
 
     for sp in specs:
         rx = sp.get("_rx")
@@ -485,10 +487,8 @@ def apply_multi_highlight(text: str, specs, color_override=None):
             s, e = m.span()
             if s == e:
                 continue
-            # skip se já houver cobertura
             if any(taken[i] for i in range(s, e)):
                 continue
-            # calcula tooltip
             tip = lab
             if callable(tooltip):
                 try:
@@ -497,20 +497,16 @@ def apply_multi_highlight(text: str, specs, color_override=None):
                     tip = lab
             elif isinstance(tooltip, str) and tooltip:
                 tip = tooltip
-            # ocupa
             for i in range(s, e):
                 taken[i] = True
             intervals.append((s, e, css_class, tip, lab))
 
-    # Monta HTML
     intervals.sort(key=lambda x: x[0])
     out = []
     cur = 0
     for s, e, klass, tip, lab in intervals:
-        # trecho "limpo"
         if cur < s:
             out.append(html_escape(text[cur:s]))
-        # trecho realçado
         frag = html_escape(text[s:e])
         out.append(f'<span class="hl-tip {klass}" data-title="{html_attr(tip)}">{frag}</span>')
         cur = e
@@ -600,18 +596,6 @@ def make_ext_link(kind, acc):
     if kind == "refseq_protein":
         return f"https://www.ncbi.nlm.nih.gov/protein/{acc}"
     return ""
-
-def html_attr(s) -> str:
-    """Escapa string para uso em atributos HTML (ex.: data-title="...")."""
-    if s is None:
-        return ""
-    s = str(s)
-    return (s.replace("&", "&amp;")
-             .replace("<", "&lt;")
-             .replace(">", "&gt;")
-             .replace('"', "&quot;")
-             .replace("'", "&#39;")
-             .replace("\n", "\\n"))
 
 # -------------------------------
 # Estado inicial
@@ -915,27 +899,22 @@ def patterns_ui_block():
     with cols[3]:
         mirna_scope = st.selectbox("miRNA alvo em", options=["mRNA (U)", "DNA (T)"], index=0)
 
-    # Limites GC% (apenas anotação no tooltip; filtro visual é manual)
     cgc1, cgc2, _ = st.columns([1,1,1.2])
     with cgc1:
         gc_min = st.slider("GC% min (siRNA)", 0.0, 100.0, 30.0, 1.0)
     with cgc2:
         gc_max = st.slider("GC% max (siRNA)", 0.0, 100.0, 52.0, 1.0)
 
-    # Monta lista de specs ativos
     active_specs = []
     for cat in sel_categories:
         active_specs.extend(PATTERN_CATALOG.get(cat, []))
 
-    # Gera padrões para miRNA seed
     if mirna_seed.strip():
         seed = re.sub(r"[^ACGTUacgtu]", "", mirna_seed.strip())
         if seed:
             if mirna_scope.startswith("mRNA"):
-                # alvo em mRNA — usamos complemento do seed (RNA)
                 seed2_8 = seed[1:8] if len(seed) >= 8 else seed[1:]
                 comp_2_8 = revcomp_rna(seed2_8)
-                # 7mer-m8: match dos 7 nt (2–8)
                 active_specs.append({
                     "key":"MIRNA_7m8_RNA",
                     "label":f"miRNA 7mer-m8 ({seed})",
@@ -946,7 +925,6 @@ def patterns_ui_block():
                     "tooltip":f"miRNA seed 7mer-m8 para {seed}",
                     "priority":12
                 })
-                # 7mer-A1: A upstream + 2–7
                 if len(seed) >= 7:
                     comp_2_7 = revcomp_rna(seed[1:7])
                     active_specs.append({
@@ -959,7 +937,6 @@ def patterns_ui_block():
                         "tooltip":f"miRNA seed 7mer-A1 (A1 + 2–7) para {seed}",
                         "priority":12
                     })
-                # 8mer: A upstream + 2–8
                 if len(seed) >= 8:
                     active_specs.append({
                         "key":"MIRNA_8MER_RNA",
@@ -972,7 +949,6 @@ def patterns_ui_block():
                         "priority":12
                     })
             else:
-                # alvo em DNA — complemento em DNA
                 seed2_8 = seed[1:8] if len(seed) >= 8 else seed[1:]
                 comp_2_8 = revcomp_dna(seed2_8)
                 active_specs.append({
@@ -1009,23 +985,20 @@ def patterns_ui_block():
                         "priority":12
                     })
 
-    # Regex manual (vira padrão "custom")
     if regex_manual.strip():
         active_specs.append({
             "key":"CUSTOM_REGEX",
             "label":"Regex manual",
             "regex":regex_manual.strip(),
             "flags":re.IGNORECASE,
-            "scope":"AA",   # mostramos em todos; na hora do render filtramos por escopo
+            "scope":"AA",
             "category_tag":"CUSTOM",
             "tooltip":"Busca manual (regex)",
             "priority":90
         })
-        # Duplicamos para DNA/mRNA também
         active_specs.append({**active_specs[-1], "scope":"DNA"})
         active_specs.append({**active_specs[-1], "scope":"mRNA"})
 
-    # Painel de seleção fina por padrão (checklist)
     if active_specs:
         st.caption("Seleção fina (habilite/desabilite padrões abaixo):")
         enabled = []
@@ -1036,7 +1009,6 @@ def patterns_ui_block():
                 enabled.append(sp)
         active_specs = enabled
 
-    # Legenda de cores
     st.markdown(
         """
         **Cores:** <span class="hl-aa">AA</span> · <span class="hl-nt">NT</span> · <span class="hl-rnai">RNAi</span> ·
@@ -1048,25 +1020,19 @@ def patterns_ui_block():
     return active_specs, gc_min, gc_max
 
 def seq_block_markdown(label, seq_text, scope, specs_all, gc_min=0.0, gc_max=100.0):
-    """Renderiza bloco com realce multicor e tooltips. 'scope' orienta o filtro de padrões."""
     if not seq_text:
         return
     st.markdown(f"**{label}**")
-    # Filtra por escopo
     use_specs = []
     for sp in specs_all or []:
         sc = sp.get("scope")
         if scope == sc or (scope in ("DNA","mRNA") and sc=="NT"):
-            # para siRNA: se tooltip guardar GC%, reforçar texto com alerta quando fora do range
             tooltip = sp.get("tooltip")
             if callable(tooltip) and "RNAi" in sp.get("category_tag",""):
-                # embrulhamos o tooltip para acrescentar faixa GC quando necessário (apenas para os siRNA AA N19 TT/UU)
                 def make_tt(tp):
                     def f(mtxt):
                         base = tp(mtxt)
-                        # tenta extrair GC% do final
                         try:
-                            # para AA[...]{19}TT pegamos mtxt[2:-2] ou correspondente
                             core = mtxt
                             if len(mtxt) >= 23 and (mtxt[:2].upper()=="AA") and (mtxt[-2:].upper() in ("TT","UU")):
                                 core = mtxt[2:-2]
@@ -1131,7 +1097,6 @@ def render_codon_mapper(context_like, container):
         mrna = seg.get("mrna","")
         aa = aa_any.get((tag, start, end), "")
 
-        # pega AA ref na posição (considerando colchetes Effatha)
         idxAA = 0
         kpos = 1
         aa_ref = None
@@ -1195,7 +1160,6 @@ def render_region_expanders(context_like, container, title=None,
         container.info("Sem sequências para mostrar.")
         return
 
-    # Controles locais da seção
     c1, c2, c3 = container.columns([1.2,1,1])
     with c1:
         exp_all = st.checkbox("Expandir todos", value=st.session_state.get("expand_all", False), key=f"expand_all_{title or 'main'}")
@@ -1228,7 +1192,6 @@ def render_region_expanders(context_like, container, title=None,
             fav_toggle = st.checkbox("⭐ Favoritar", value=fav_state, key=f"fav_{title}_{tag}_{start}_{end}")
             toggle_fav(tag, start, end, fav_toggle)
 
-            # AA
             aa_obs = aa_idx_obs.get((tag, start, end), "")
             aa_fil = aa_idx_fil.get((tag, start, end), "")
             aa_any = "" if (aa_obs or aa_fil) else aa_idx_any.get((tag, start, end), "")
@@ -1303,7 +1266,6 @@ def render_outputs(context, paths, enable_blast_flag):
     kpi_source_box(ncbi_prot_container, srcs.get("ncbi_protein"), "NCBI Protein")
     kpi_source_box(ncbi_gene_container, srcs.get("ncbi_gene"), "NCBI Gene")
 
-    # ----- Regiões (cards)
     cards = context.get("region_cards", []) or []
     with regions_placeholder:
         if not cards or pd is None:
@@ -1332,7 +1294,6 @@ def render_outputs(context, paths, enable_blast_flag):
             df = pd.DataFrame(rows)
             st.dataframe(df, use_container_width=True)
 
-    # ===== Busca & marcação (novo bloco)
     with seqs_container:
         active_specs, gc_min, gc_max = patterns_ui_block()
 
@@ -1383,7 +1344,6 @@ def render_outputs(context, paths, enable_blast_flag):
         with tool_col2:
             st.info("Dica: combine categorias (ex.: RNAi + Promotores) e regex manual para investigações específicas. Passe o mouse nos trechos marcados para ver o tooltip.")
 
-    # ----- Auditoria BLAST
     with blast_audit_container:
         st.subheader("Auditoria BLAST — hits aceitos")
         run_dir = Path(st.session_state.get("last_run_dir") or "")
@@ -1409,11 +1369,10 @@ def render_outputs(context, paths, enable_blast_flag):
                         st.info("Não foi possível ler os CSVs de auditoria BLAST.")
                     else:
                         df_all = pd.concat(dfs, ignore_index=True)
-                        # Normaliza nomes comuns
                         rename_map = {
                             "region":"region_tag",
                             "percent_identity":"pct_identity",
-                            "sbjct_id":"accession"  # se vier outro nome
+                            "sbjct_id":"accession"
                         }
                         for c_old, c_new in rename_map.items():
                             if c_old in df_all.columns and c_new not in df_all.columns:
@@ -1463,7 +1422,6 @@ def render_outputs(context, paths, enable_blast_flag):
                             mime="text/csv"
                         )
 
-    # ----- Downloads
     with downloads_container:
         st.subheader("Downloads")
         try:
@@ -1593,7 +1551,7 @@ Para **cada sequência** abaixo:
     return str(prompt_md_path), str(prompt_txt_path)
 
 # -------------------------------
-# Execução
+# Execução síncrona original (mantida)
 # -------------------------------
 def _sanitize(s: str) -> str:
     return "".join(ch for ch in (s or "") if ch.isalnum() or ch in ("-", "_", ".")).strip() or "run"
@@ -1701,28 +1659,19 @@ def run_pipeline_and_render():
         },
     }
 
-    # opcional: restringir BLAST pela espécie (se o pipeline suportar)
     cfg_overrides["blast"]["same_species_only"] = bool(st.session_state.get("blast_same_species_only", True))
 
-    # escrever shim e executar
     shim_path = write_shim(run_dir, st.session_state["pipeline_path"], cfg_overrides)
     py_exe = sys.executable
 
     with st.status("Executando pipeline…", expanded=True) as status:
-
-        def _push(text):
-            # atualiza a aba "Logs" em tempo real
-            log_placeholder.code(text)
-
-        # === usando execução streaming com heartbeat ===
-        rc, log_text = run_subprocess_streaming(py_exe, shim_path, run_dir, on_update=_push)
-
+        rc, out, err = run_subprocess(py_exe, shim_path, run_dir)
+        log_placeholder.code((out or "") + ("\n" + err if err else ""))
         if rc == 0:
             status.update(label="Execução concluída", state="complete")
         else:
             status.update(label=f"Erro (exit code {rc}) — veja 'Logs'", state="error")
 
-    # carregar contexto
     context_path = Path(run_dir) / "context_summary.json"
     context = None
     if context_path.exists():
@@ -1731,7 +1680,6 @@ def run_pipeline_and_render():
         except Exception as e:
             tab_resumo.error(f"Falha ao ler context_summary.json: {e}")
 
-    # gerar prompt Effatha (arquivo)
     treatment_goal = st.session_state.get("treatment_goal", "").strip()
     mech_flags = {
         "aproximar": bool(st.session_state.get("allow_aproximar", True)),
@@ -1768,13 +1716,228 @@ def run_pipeline_and_render():
     else:
         tab_resumo.info("Contexto não encontrado — verifique os Logs para erros no pipeline.")
 
-    # -------------------------------
-    # Run / Restore
-    # -------------------------------
+# -------------------------------
+# Camada DETACHED: start/poll/finalize
+# -------------------------------
+def _start_pipeline_job() -> dict:
+    pp = Path(st.session_state["pipeline_path"])
+    if not pp.is_file():
+        st.error(f"Arquivo não encontrado: {pp}")
+        st.stop()
 
+    run_dir = make_run_dir(st.session_state.get("artifacts_dir") or "runs")
+    src_label = st.session_state["source_choice"]
+    if src_label == "UniProt":
+        id_hint = st.session_state.get("uniprot_acc", "")
+    elif src_label == "PDB":
+        id_hint = st.session_state.get("pdb_id", "")
+    elif src_label == "NCBI Protein":
+        id_hint = st.session_state.get("ncbi_protein_acc", "")
+    else:
+        if st.session_state.get("gene_mode") == "GeneID":
+            id_hint = st.session_state.get("gene_id", "")
+        else:
+            sym = st.session_state.get("gene_symbol", "")
+            tax = str(st.session_state.get("gene_taxid") or "")
+            id_hint = f"{sym}_{tax}" if sym else tax
 
+    slug = _sanitize(id_hint)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    report_path = str(run_dir / f"report_{slug}_{ts}.txt")
+    regions_csv_path = str(run_dir / f"regions_{slug}_{ts}.csv")
+    blast_csv_path = str(run_dir / f"variants_blast_{slug}_{ts}.csv")
+
+    cfg_overrides = {
+        "input": {
+            "source": ("uniprot" if src_label=="UniProt" else
+                       "pdb" if src_label=="PDB" else
+                       "ncbi_protein" if src_label=="NCBI Protein" else
+                       "ncbi_gene"),
+            "uniprot_acc": st.session_state.get("uniprot_acc","").strip(),
+            "pdb_id": st.session_state.get("pdb_id","").strip(),
+            "ncbi_protein_acc": st.session_state.get("ncbi_protein_acc","").strip(),
+            "gene": {
+                "id_type": ("entrez" if st.session_state.get("gene_mode")=="GeneID" else "symbol"),
+                "id": st.session_state.get("gene_id","").strip(),
+                "symbol": st.session_state.get("gene_symbol","").strip(),
+                "taxid": int(st.session_state.get("gene_taxid") or 9606),
+                "isoform_policy": st.session_state.get("isoform_policy","longest"),
+            },
+        },
+        "external_layers": {
+            "uniprot_variant": {"enable": bool(st.session_state.get("enable_uniprot_variant", True))},
+            "variation_api": {"enable": bool(st.session_state.get("enable_variation_api", True))},
+        },
+        "blast": {
+            "enable": bool(st.session_state.get("enable_blast", False)),
+            "protein": {
+                "db": st.session_state.get("blast_db", "swissprot"),
+                "hitlist_size": int(st.session_state.get("blast_hitlist_size", 25)),
+                "expect": 1e-5,
+                "min_identity": float(st.session_state.get("blast_min_id", 0.97)),
+                "min_query_coverage": float(st.session_state.get("blast_min_cov", 0.95)),
+            },
+            "same_species_only": bool(st.session_state.get("blast_same_species_only", True)),
+        },
+        "variation_filters": {
+            "enabled": bool(st.session_state.get("enable_filters", True)),
+            "min_af": float(st.session_state.get("min_af", 0.01)),
+            "clinical": {
+                "allow": st.session_state.get("allow_clin", []),
+                "allow_if_conflicting": bool(st.session_state.get("allow_if_conflicting", False)),
+                "allow_uncertain": bool(st.session_state.get("allow_uncertain", False)),
+            },
+            "evidence": {
+                "assertion": st.session_state.get("evidence_mode", "prefer_manual"),
+                "treat_missing_as": st.session_state.get("missing_evid", "include"),
+            },
+            "predictions": {
+                "sift_allow": [str(x) for x in st.session_state.get("sift_allow", [])],
+                "polyphen_allow": [str(x) for x in st.session_state.get("polyphen_allow", [])],
+                "require_both": bool(st.session_state.get("require_both", False)),
+            },
+            "include_blast_in_filtered": bool(st.session_state.get("include_blast_in_filtered", False)),
+        },
+        "regions": {
+            "point_flank": int(st.session_state.get("point_flank", 5)),
+            "default_min_len": int(st.session_state.get("default_min_len", 6)),
+            "merge_overlaps": bool(st.session_state.get("merge_overlaps", True)),
+            "add_full": bool(st.session_state.get("add_full", True)),
+            "include_ncbi_protein_features": bool(st.session_state.get("include_ncbi_features", True)),
+        },
+        "output": {
+            "report_txt": report_path,
+            "export_regions_csv": regions_csv_path,
+            "export_csv": (blast_csv_path if st.session_state.get("enable_blast", False) else None),
+            "artifacts_dir": str(run_dir),
+            "blast_progress": True,
+        },
+    }
+
+    shim_path = write_shim(run_dir, st.session_state["pipeline_path"], cfg_overrides)
+    pid = _spawn_detached(sys.executable, shim_path.name, run_dir)
+
+    job = {
+        "pid": pid,
+        "run_dir": str(run_dir),
+        "slug": slug,
+        "ts": ts,
+        "report": report_path,
+        "regions_csv": regions_csv_path,
+        "blast_csv": blast_csv_path,
+    }
+    st.session_state["__job"] = job
+    return job
+
+def _render_running_job(job: dict):
+    run_dir = Path(job["run_dir"])
+    st.info(f"🏃 Execução em andamento (PID {job['pid']}) — pasta: `{run_dir.name}`")
+    st.autorefresh(interval=2000, key="__poll_refresh")
+
+    logp = run_dir / "live.log"
+    if logp.exists():
+        log_text = _tail_file(logp, max_kb=512)
+        log_placeholder.code(log_text or "[log vazio]")
+    else:
+        log_placeholder.code("[aguardando live.log…]")
+
+    c1, c2 = st.columns([1,1])
+    with c1:
+        if st.button("❌ Cancelar execução"):
+            try:
+                _cancel_pid(int(job["pid"]))
+                st.warning("Job cancelado.")
+            except Exception as e:
+                st.error(f"Falha ao cancelar: {e}")
+            st.session_state.pop("__job", None)
+            st.rerun()
+    with c2:
+        st.caption("A UI atualiza automaticamente a cada 2s.")
+
+def _try_finalize_job(job: dict):
+    run_dir = Path(job["run_dir"])
+    rc_file = run_dir / "job.rc"
+    if not rc_file.exists():
+        return False
+
+    try:
+        rc = int((rc_file.read_text(encoding="utf-8").strip() or "1"))
+    except Exception:
+        rc = 1
+
+    context_path = run_dir / "context_summary.json"
+    context = None
+    if context_path.exists():
+        try:
+            context = json.loads(context_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            tab_resumo.error(f"Falha ao ler context_summary.json: {e}")
+
+    # gerar prompt (mesma lógica do síncrono)
+    treatment_goal = st.session_state.get("treatment_goal", "").strip()
+    mech_flags = {
+        "aproximar": bool(st.session_state.get("allow_aproximar", True)),
+        "distanciar": bool(st.session_state.get("allow_distanciar", True)),
+        "mimetizar": bool(st.session_state.get("allow_mimetizar", True)),
+    }
+    prompt_md_path = ""
+    prompt_txt_path = ""
+    if context:
+        try:
+            prompt_md_path, prompt_txt_path = write_prompt_file(
+                run_dir,
+                context=context,
+                treatment_goal=treatment_goal,
+                mech_flags=mech_flags,
+                report_path=job.get("report",""),
+                slug=job.get("slug","run"),
+                ts=job.get("ts",""),
+            )
+        except Exception as e:
+            tab_resumo.warning(f"Falha ao gerar Prompt Effatha: {e}")
+
+    paths = {
+        "report": job.get("report",""),
+        "regions_csv": job.get("regions_csv",""),
+        "blast_csv": job.get("blast_csv",""),
+        "prompt_md": prompt_md_path,
+        "prompt_txt": prompt_txt_path,
+    }
+
+    save_session(run_dir, context or {}, paths, st.session_state.get("enable_blast", False),
+                 treatment_goal, mech_flags)
+
+    st.session_state.pop("__job", None)
+
+    if rc == 0 and context:
+        st.success("Execução concluída.")
+        render_outputs(context, paths, st.session_state.get("last_enable_blast", False))
+    else:
+        st.error(f"Execução finalizada com erro (rc={rc}). Veja 'Logs'.")
+        # Mostrar último log mesmo assim
+        logp = run_dir / "live.log"
+        if logp.exists():
+            log_text = _tail_file(logp, max_kb=512)
+            log_placeholder.code(log_text or "[log vazio]")
+    return True
+
+# === Driver ===
 if st.session_state.get("run_btn"):
-    run_pipeline_and_render()
+    if st.session_state.get("__job"):
+        st.warning("Já existe uma execução em andamento.")
+    else:
+        _start_pipeline_job()
+        st.experimental_rerun()
+
+job = st.session_state.get("__job")
+if job:
+    pid_ok = _proc_is_running(int(job.get("pid", 0)))
+    if (Path(job["run_dir"]) / "job.rc").exists() or not pid_ok:
+        if not _try_finalize_job(job):
+            _render_running_job(job)
+    else:
+        _render_running_job(job)
 elif st.session_state.get("last_context"):
     render_outputs(
         st.session_state.get("last_context"),
