@@ -19,6 +19,7 @@ from pathlib import Path
 from datetime import datetime
 
 import streamlit as st
+import streamlit.components.v1 as components  # <-- para keepalive
 
 # ==== Config inicial ====
 st.set_page_config(page_title="Effatha — Functional Regions", layout="wide")
@@ -48,6 +49,20 @@ def _auto_poll(interval_ms=2000, key="__auto_poll__"):
         _safe_rerun()
     except Exception:
         pass
+
+# Keep-alive leve no cliente (ajuda em provedores gratuitos)
+def keepalive(interval_ms=60000):
+    components.html(
+        f"""
+        <script>
+        const ping = () => fetch(window.location.pathname + '?_keepalive=' + Date.now(), {{
+            method: 'GET', cache: 'no-store', keepalive: true
+        }}).catch(()=>{{}});
+        setInterval(ping, {interval_ms});
+        </script>
+        """,
+        height=0,
+    )
 
 # Optional deps
 try:
@@ -260,6 +275,12 @@ def _start_pipeline_job(py_exe, shim_path: Path, cwd: Path):
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    # Limitar threads (Render Free)
+    env.setdefault("BLAST_NUM_THREADS", "1")
+    env.setdefault("OMP_NUM_THREADS", "1")
+    env.setdefault("OPENBLAS_NUM_THREADS", "1")
+    env.setdefault("MKL_NUM_THREADS", "1")
+
     stdout_file = cwd / "stdout.log"
     stderr_file = cwd / "stderr.log"
     so = open(stdout_file, "w", encoding="utf-8", buffering=1)
@@ -271,8 +292,16 @@ def _start_pipeline_job(py_exe, shim_path: Path, cwd: Path):
         stdout=so,
         stderr=se,
         text=True,
-        bufsize=1
+        bufsize=1,
+        preexec_fn=os.setsid  # cria grupo para cancelamento total
     )
+    # Fecha no pai (filho mantém seus FDs)
+    try:
+        so.close()
+        se.close()
+    except Exception:
+        pass
+
     st.session_state["job"] = {
         "pid": proc.pid,
         "run_dir": str(cwd),
@@ -309,7 +338,7 @@ def _poll_job_status():
         return job
     return job
 
-def _tail_file(path: Path, max_bytes=100000):
+def _tail_file(path: Path, max_bytes=40000):  # tail mais leve
     try:
         with open(path, "rb") as fh:
             fh.seek(0, os.SEEK_END)
@@ -329,11 +358,12 @@ def _cancel_job():
         return
     pid = job.get("pid")
     try:
-        os.kill(pid, signal.SIGTERM)
-        time.sleep(0.3)
+        # Mata todo o grupo (pai + filhos, ex.: BLAST)
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGTERM)
+        time.sleep(0.5)
         try:
-            os.kill(pid, 0)
-            os.kill(pid, signal.SIGKILL)
+            os.killpg(pgid, signal.SIGKILL)
         except Exception:
             pass
     except Exception:
@@ -558,11 +588,11 @@ def guess_accession_from_sbjct(s: str):
     if m:
         acc = m.group(1)
         return "uniprot", acc
-    m = re.search(r"(?:^|[|\\s])(NP|XP|YP|WP)_\\d+(?:\\.\\d+)?", s)
+    m = re.search(r"(?:^|[|\s])(NP|XP|YP|WP)_\d+(?:\.\d+)?", s)
     if m:
         acc = m.group(0).strip(" |")
         return "refseq_protein", acc
-    if re.match(r"^[A-NR-Z]\\d{5}(-\\d+)?$", s) or re.match(r"^[OPQ][0-9][A-Z0-9]{3}[0-9](-\\d+)?$", s):
+    if re.match(r"^[A-NR-Z]\d{5}(-\d+)?$", s) or re.match(r"^[OPQ][0-9][A-Z0-9]{3}[0-9](-\d+)?$", s):
         return "uniprot", s
     return None, None
 
@@ -579,6 +609,9 @@ def make_ext_link(kind, acc):
 # Estado inicial
 # -------------------------------
 st.title("Gene & Protein Analyzer")
+
+# Keep-alive de 60s geral
+keepalive(60000)
 
 if "favorites" not in st.session_state:
     st.session_state["favorites"] = set()
@@ -1519,14 +1552,22 @@ def render_outputs(context, paths, enable_blast_flag):
                 st.download_button("Baixar contexto (.json)", data=ctx_path.read_bytes(),
                                    file_name=ctx_path.name, mime="application/json")
 
+            # Bundle do run — GERAÇÃO SOB DEMANDA (evita custo em cada rerun)
             run_dir = Path(st.session_state.get("last_run_dir") or "")
             if run_dir.exists():
-                zip_path = run_dir.with_suffix(".zip")
-                with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-                    for path in run_dir.rglob("*"):
-                        z.write(path, arcname=path.relative_to(run_dir))
-                st.download_button("Baixar bundle do run (.zip)", data=zip_path.read_bytes(),
-                                   file_name=zip_path.name, mime="application/zip")
+                if "bundle_zip_path" not in st.session_state:
+                    st.session_state["bundle_zip_path"] = ""
+                if st.button("Gerar bundle do run (.zip)"):
+                    zip_path = run_dir.with_suffix(".zip")
+                    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                        for path in run_dir.rglob("*"):
+                            z.write(path, arcname=path.relative_to(run_dir))
+                    st.session_state["bundle_zip_path"] = str(zip_path)
+                if st.session_state["bundle_zip_path"]:
+                    zp = Path(st.session_state["bundle_zip_path"])
+                    if zp.exists():
+                        st.download_button("Baixar bundle do run (.zip)", data=zp.read_bytes(),
+                                           file_name=zp.name, mime="application/zip")
         except Exception as e:
             st.error(f"Erro ao preparar downloads: {e}")
 
@@ -1676,9 +1717,10 @@ if job and job.get("status") in ("running", "canceled", "finished", "unknown"):
         err = _tail_file(Path(job["stderr"]))
         log_placeholder.code((out or "") + ("\n" + err if err else ""))
 
-        # Auto-poll enquanto rodando (compat)
+        # Auto-poll enquanto rodando (compat) — intervalo mais leve + keepalive rápido
         if job.get("status") == "running":
-            _auto_poll(2000, key="job_refresh")
+            keepalive(20000)
+            _auto_poll(8000, key="job_refresh")
 
     # Quando finalizar/cancelar, carregar artefatos e renderizar
     if job.get("status") in ("finished", "canceled"):
