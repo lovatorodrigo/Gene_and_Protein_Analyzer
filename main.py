@@ -87,6 +87,18 @@ CONFIG: Dict[str, Any] = {
 
             # será setado dinamicamente quando tivermos taxid (ex.: "txid9606[ORGN]")
             "entrez_query": None,
+
+            # ====== NOVO: estratégia FULL-primeiro ======
+            "smart_full_first": True,            # ativa o modo FULL primeiro
+            "full_dbs": None,                    # opcional: override de bancos só para o FULL
+            "full_hitlist_size": 50,             # lista menor no FULL (reduz latência)
+            "full_min_query_coverage": 0.60,     # cobertura mínima para aceitar HSP do FULL
+            "max_alignments_process": 200,       # proteção (em caso de recs muito grandes)
+
+            # fallback de janela (só se faltar cobertura relevante)
+            "regions_min_len_blast": 40,         # só BLASTar janela se len >= isso
+            "gap_frac_threshold": 0.15,          # fração de posições sem HSP no FULL para disparar janela
+            "skip_tags_for_region_blast": ["COMPOSITIONAL BIAS"],  # pular tags ruidosas
         },
         "nt": {
             "dna_db": "nt",           # DNA
@@ -788,7 +800,7 @@ def ensure_blast_same_species_filters_from_taxid(taxid: Optional[int], species: 
             print(f"[BLAST] Filtro por espécie aplicado: {q}")
 
 # =========================
-# BLAST por região
+# BLAST por região (mantido, sem remoções)
 # =========================
 def blastp_region(seq_window: str, entrez_query: Optional[str], params: Dict) -> Dict[int, set]:
     if not seq_window or not re.search(r"[A-Z]", seq_window):
@@ -968,6 +980,95 @@ def blastn_region(nt_window: str, db: str, params: Dict, is_mrna: bool=False) ->
     return variants
 
 # =========================
+# NOVO — BLAST FULL para agregar variantes absolutas (AA)
+# =========================
+def _aggregate_variants_from_full_hsp(seq_len: int, hsp, aln, db_used: str, region_label: str,
+                                      min_id: float, min_cov: float,
+                                      variants_abs: Dict[int, set], covered_abs: set):
+    qseq = hsp.query
+    hseq = hsp.sbjct
+    q_aligned = sum(1 for c in qseq if c != '-')
+    if q_aligned == 0:
+        return
+    cov = q_aligned / seq_len
+    if cov < min_cov:
+        return
+    ident = hsp.identities / q_aligned
+    if ident < min_id:
+        return
+
+    # Auditoria do FULL (region_label="FULL")
+    _audit_hit(
+        kind="protein",
+        db=db_used,
+        region_tag=region_label,
+        accession=getattr(aln, "accession", "") or "",
+        hit_def=getattr(aln, "hit_def", "") or "",
+        pid=ident,
+        cov=cov,
+        hsp_query_len=q_aligned
+    )
+
+    # Mapear variações em coordenadas ABSOLUTAS do query
+    # hsp.query_start é 1-based sem contar gaps
+    qabs = int(getattr(hsp, "query_start", 1)) - 1
+    for qc, hc in zip(qseq, hseq):
+        if qc != '-':
+            qabs += 1
+            if 1 <= qabs <= seq_len:
+                covered_abs.add(qabs)
+                if hc != '-' and qc != hc:
+                    variants_abs.setdefault(qabs, set()).add(hc)
+
+def blastp_full_aggregate_variants(seq_full: str, entrez_query: Optional[str], params: Dict) -> Tuple[Dict[int, set], set]:
+    """
+    Roda BLASTp UMA VEZ no FULL (em 1+ bancos) e agrega variantes por posição absoluta do query.
+    Retorna (variants_abs, covered_abs_positions_set).
+    Usa thresholds específicos do FULL (params['full_min_query_coverage']).
+    """
+    if not seq_full or not re.search(r"[A-Z]", seq_full):
+        return {}, set()
+
+    L = len(seq_full)
+    variants_abs: Dict[int, set] = {}
+    covered_abs: set = set()
+
+    dbs = params.get("full_dbs") or params.get("dbs") or [params.get("db", "nr")]
+    min_id = float(params.get("min_identity", 0.85))
+    min_cov_full = float(params.get("full_min_query_coverage", params.get("min_query_coverage", 0.90)))
+    hitlist_full = int(params.get("full_hitlist_size", min(params.get("hitlist_size", 200), 50)))
+    max_align = int(params.get("max_alignments_process", 200))
+
+    for db in dbs:
+        if CONFIG["output"]["blast_progress"]:
+            print(f"[BLASTp] FULL ({L} aa) em {db} (mesmo taxon via entrez_query={params.get('entrez_query')})…")
+        handle = NCBIWWW.qblast(
+            program="blastp",
+            database=db,
+            sequence=seq_full,
+            hitlist_size=hitlist_full,
+            expect=float(params.get("expect", 1e-5)),
+            entrez_query=params.get("entrez_query"),
+            service="plain",
+            megablast=False
+        )
+        rec = NCBIXML.read(handle); handle.close()
+
+        # varrer top alinhamentos (limite de segurança)
+        count_aln = 0
+        for aln in rec.alignments:
+            count_aln += 1
+            if count_aln > max_align:
+                break
+            for hsp in aln.hsps:
+                _aggregate_variants_from_full_hsp(
+                    seq_len=L, hsp=hsp, aln=aln, db_used=db, region_label="FULL",
+                    min_id=min_id, min_cov=min_cov_full,
+                    variants_abs=variants_abs, covered_abs=covered_abs
+                )
+    return variants_abs, covered_abs
+
+# =========================
 # Effatha builders
 # =========================
 def effatha_aa(seq: str, region: Region, local_variants: Dict[int, set]) -> str:
@@ -1042,21 +1143,58 @@ def core_pipeline_using_uniprot(target_uniprot: str,
     # ===== AA por região (BLASTp → Effatha) =====
     aa_by_region: List[Tuple[str,int,int,str,str]] = []
     blast_positions_count = 0
+    full_variants_abs: Dict[int, set] = {}
+    full_covered_abs: set = set()
+
     if CONFIG["blast"]["enable"]:
         bp = CONFIG["blast"]["protein"]
         entrez_q = bp.get("entrez_query")
+
+        if bp.get("smart_full_first", True):
+            # ---------- 1) FULL primeiro ----------
+            full_variants_abs, full_covered_abs = blastp_full_aggregate_variants(seq, entrez_q, bp)
+
         for r in regs:
             frag = seq[r.start_1based-1:r.end_1based]
-            if CONFIG["output"]["blast_progress"]:
-                dbs_log = bp.get("dbs") or [bp.get("db","nr")]
-                print(f"[BLASTp] {r.tag} ({len(frag)} aa) em {dbs_log} (mesmo taxon via entrez_query={entrez_q})…")
-            try:
-                bp_with_tag = {**bp, "audit_region_tag": r.tag}
-                local_vars = blastp_region_multi(frag, entrez_q, bp_with_tag)
-            except Exception as e:
-                if CONFIG["output"]["blast_progress"]:
-                    print(f"[WARN] BLASTP falhou em {r.tag} {r.start_1based}-{r.end_1based}: {e}")
-                local_vars = {}
+
+            # Slicing das variantes do FULL para a região (posições relativas 1..len)
+            local_vars: Dict[int, set] = {}
+            if full_variants_abs:
+                for i_abs in range(r.start_1based, r.end_1based + 1):
+                    if i_abs in full_variants_abs:
+                        local_vars.setdefault(i_abs - r.start_1based + 1, set()).update(full_variants_abs[i_abs])
+
+            need_window_blast = False
+            if bp.get("smart_full_first", True):
+                # Critérios de fallback por janela
+                region_len = r.length
+                if region_len >= int(bp.get("regions_min_len_blast", 40)):
+                    region_positions = set(range(r.start_1based, r.end_1based + 1))
+                    covered_here = region_positions & full_covered_abs
+                    gap_frac = 1.0 - (len(covered_here) / float(region_len)) if region_len else 1.0
+                    skip_tags = set(t.strip().upper() for t in bp.get("skip_tags_for_region_blast", []))
+                    tag_upper = (r.tag or "").upper()
+                    need_window_blast = (gap_frac > float(bp.get("gap_frac_threshold", 0.15))) and (tag_upper not in skip_tags)
+
+                    if CONFIG["output"]["blast_progress"]:
+                        print(f"[BLASTp] {r.tag} ({region_len} aa) — cobertura FULL≈{(1-gap_frac):.1%} "
+                              f"| fallback_janela={'SIM' if need_window_blast else 'NÃO'}")
+
+            # ---------- 2) Fallback por janela (se necessário) ----------
+            if need_window_blast or not bp.get("smart_full_first", True):
+                if CONFIG["output"]["blast_progress"] and bp.get("smart_full_first", True):
+                    dbs_log = bp.get("dbs") or [bp.get("db","nr")]
+                    print(f"[BLASTp] Fallback por janela em {dbs_log} (mesmo taxon via entrez_query={entrez_q})…")
+                try:
+                    bp_with_tag = {**bp, "audit_region_tag": r.tag}
+                    local_extra = blastp_region_multi(frag, entrez_q, bp_with_tag)
+                    # mesclar com o que veio do FULL
+                    for k, alts in local_extra.items():
+                        local_vars.setdefault(k, set()).update(alts)
+                except Exception as e:
+                    if CONFIG["output"]["blast_progress"]:
+                        print(f"[WARN] BLASTP falhou em {r.tag} {r.start_1based}-{r.end_1based}: {e}")
+
             blast_positions_count += len(local_vars)
             aa_eff = effatha_aa(seq, r, local_vars)
             aa_by_region.append((r.tag, r.start_1based, r.end_1based, aa_eff, r.note))
@@ -1262,18 +1400,38 @@ def run_from_ncbi_protein(refseq_acc: str):
     aa_by_region = []
     if CONFIG["blast"]["enable"]:
         bp = CONFIG["blast"]["protein"]
+        # mesmo comportamento do core: FULL-primeiro se ligado
+        full_vars_abs, full_cov_abs = ({}, set())
+        if bp.get("smart_full_first", True):
+            full_vars_abs, full_cov_abs = blastp_full_aggregate_variants(seq, bp.get("entrez_query"), bp)
+
         for rgn in regs:
             frag = seq[rgn.start_1based-1:rgn.end_1based]
-            if CONFIG["output"]["blast_progress"]:
-                dbs_log = bp.get("dbs") or [bp.get("db","nr")]
-                print(f"[BLASTp] {rgn.tag} ({len(frag)} aa) em {dbs_log} (mesmo taxon via entrez_query={bp.get('entrez_query')})…")
-            try:
-                bp_with_tag = {**bp, "audit_region_tag": rgn.tag}
-                local_vars = blastp_region_multi(frag, bp.get("entrez_query"), bp_with_tag)
-            except Exception as e:
+            local_vars = {}
+            # slicer do FULL
+            if full_vars_abs:
+                for i_abs in range(rgn.start_1based, rgn.end_1based + 1):
+                    if i_abs in full_vars_abs:
+                        local_vars.setdefault(i_abs - rgn.start_1based + 1, set()).update(full_vars_abs[i_abs])
+
+            need_window = True
+            if bp.get("smart_full_first", True):
+                region_positions = set(range(rgn.start_1based, rgn.end_1based + 1))
+                gap = 1.0 - (len(region_positions & full_cov_abs) / float(rgn.length)) if rgn.length else 1.0
+                need_window = (rgn.length >= int(bp.get("regions_min_len_blast", 40))) and (gap > float(bp.get("gap_frac_threshold", 0.15))) and ((rgn.tag or "").upper() not in set(t.upper() for t in bp.get("skip_tags_for_region_blast", [])))
+
+            if need_window or not bp.get("smart_full_first", True):
                 if CONFIG["output"]["blast_progress"]:
-                    print(f"[WARN] BLASTP falhou: {e}")
-                local_vars = {}
+                    dbs_log = bp.get("dbs") or [bp.get("db","nr")]
+                    print(f"[BLASTp] {rgn.tag} ({rgn.length} aa) em {dbs_log} (mesmo taxon via entrez_query={bp.get('entrez_query')})…")
+                try:
+                    bp_with_tag = {**bp, "audit_region_tag": rgn.tag}
+                    local_extra = blastp_region_multi(frag, bp.get("entrez_query"), bp_with_tag)
+                    for k, alts in local_extra.items():
+                        local_vars.setdefault(k, set()).update(alts)
+                except Exception as e:
+                    if CONFIG["output"]["blast_progress"]:
+                        print(f"[WARN] BLASTP falhou: {e}")
             aa_by_region.append({"tag":rgn.tag,"start":rgn.start_1based,"end":rgn.end_1based,"aa": effatha_aa(seq, rgn, local_vars)})
     else:
         for rgn in regs:
