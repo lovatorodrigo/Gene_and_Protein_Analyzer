@@ -24,9 +24,6 @@ import streamlit.components.v1 as components  # <-- para keepalive
 # ==== Config inicial ====
 st.set_page_config(page_title="Effatha — Functional Regions", layout="wide")
 
-# Limite de tempo (watchdog) para evitar jobs eternos (90 min padrão)
-MAX_JOB_SECONDS = int(os.getenv("MAX_JOB_SECONDS", "5400"))
-
 # Wrapper de rerun compatível (Streamlit novo/antigo)
 def _safe_rerun():
     try:
@@ -226,21 +223,30 @@ def write_shim(run_dir: Path, module_path, cfg_overrides):
     cfg_path = run_dir / "cfg_overrides.json"
     cfg_path.write_text(json.dumps(cfg_overrides, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    # --- shim com logs sem buffer (unbuffered/line-buffering) + logging integrado ---
     shim_code = f"""# AUTO-GERADO pelo app Streamlit (não editar)
-import json, sys, importlib.util, pathlib, traceback, time
+import json, sys, importlib.util, pathlib, traceback, time, os, logging
+
+# Força logs imediatos no arquivo
 try:
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True, write_through=True)
+    sys.stderr.reconfigure(encoding="utf-8", line_buffering=True, write_through=True)
 except Exception:
-    pass
-
-run_dir = pathlib.Path(__file__).resolve().parent
-status_path = run_dir / "shim_status.json"
-
-def write_status(status, message=None):
     try:
-        payload = {{"status": status, "message": message, "ts": time.time()}}
-        status_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.environ["PYTHONUNBUFFERED"] = "1"
+    except Exception:
+        pass
+
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stdout,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    force=True,
+)
+
+def _log(msg):
+    try:
+        print(f"[shim] {{time.strftime('%Y-%m-%d %H:%M:%S')}} | " + str(msg), flush=True)
     except Exception:
         pass
 
@@ -251,49 +257,49 @@ def deep_update(d, u):
         else:
             d[k] = v
 
-module_path = r\"\"\"{Path(module_path).resolve()}\"\"\"\nspec = importlib.util.spec_from_file_location("pipeline_mod", module_path)
+module_path = r\"\"\"{Path(module_path).resolve()}\"\"\"  # preenchido pelo app
+spec = importlib.util.spec_from_file_location("pipeline_mod", module_path)
 if spec is None or spec.loader is None:
-    write_status("error", "Falha ao carregar spec: " + module_path)
     raise RuntimeError("Falha ao carregar spec para o pipeline: " + module_path)
 
 mod = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = mod
 try:
     spec.loader.exec_module(mod)
-except SystemExit as se:
-    write_status("error", f"SystemExit ao carregar módulo: {{se}}")
-    raise
-except Exception as e:
+    _log("pipeline module loaded")
+except Exception:
     traceback.print_exc()
-    write_status("error", f"Exceção ao carregar módulo: {{e}}")
+    _log("EXCEPTION while loading module")
     raise
 
+with open("cfg_overrides.json", "r", encoding="utf-8") as fh:
+    overrides = json.load(fh)
+deep_update(mod.CONFIG, overrides)
+_log(f"overrides merged; input.source={{mod.CONFIG['input']['source']}}")
+
+src = (mod.CONFIG["input"]["source"] or "").lower()
 try:
-    with open("cfg_overrides.json", "r", encoding="utf-8") as fh:
-        overrides = json.load(fh)
-    deep_update(mod.CONFIG, overrides)
-
-    src = (mod.CONFIG["input"]["source"] or "").lower()
     if src == "uniprot":
+        _log("starting run_from_uniprot")
         mod.run_from_uniprot(mod.CONFIG["input"]["uniprot_acc"])
+        _log("finished run_from_uniprot")
     elif src == "pdb":
+        _log("starting run_from_pdb")
         mod.run_from_pdb(mod.CONFIG["input"]["pdb_id"])
+        _log("finished run_from_pdb")
     elif src == "ncbi_protein":
+        _log("starting run_from_ncbi_protein")
         mod.run_from_ncbi_protein(mod.CONFIG["input"]["ncbi_protein_acc"])
+        _log("finished run_from_ncbi_protein")
     elif src == "ncbi_gene":
+        _log("starting run_from_ncbi_gene")
         mod.run_from_ncbi_gene(mod.CONFIG["input"]["gene"])
+        _log("finished run_from_ncbi_gene")
     else:
-        write_status("error", "CONFIG['input']['source'] inválido")
         raise ValueError("CONFIG['input']['source'] deve ser 'pdb' | 'uniprot' | 'ncbi_protein' | 'ncbi_gene'.")
-
-    # Se chegamos aqui, o pipeline retornou sem exceção:
-    write_status("ok", "pipeline finalizado")
-except SystemExit as se:
-    write_status("error", f"SystemExit durante run: {{se}}")
-    raise
 except Exception as e:
     traceback.print_exc()
-    write_status("error", f"Exceção durante run: {{e}}")
+    _log(f"EXCEPTION during run: {{e}}")
     raise
 """
     shim_path = run_dir / "shim_run.py"
@@ -304,6 +310,7 @@ def _start_pipeline_job(py_exe, shim_path: Path, cwd: Path):
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"  # <- força I/O sem buffer no filho
     # Limitar threads (Render Free)
     env.setdefault("BLAST_NUM_THREADS", "1")
     env.setdefault("OMP_NUM_THREADS", "1")
@@ -315,7 +322,7 @@ def _start_pipeline_job(py_exe, shim_path: Path, cwd: Path):
     so = open(stdout_file, "w", encoding="utf-8", buffering=1)
     se = open(stderr_file, "w", encoding="utf-8", buffering=1)
     proc = subprocess.Popen(
-        [py_exe, shim_path.name],
+        [py_exe, "-u", shim_path.name],  # <- -u = unbuffered
         cwd=str(cwd),
         env=env,
         stdout=so,
@@ -343,88 +350,28 @@ def _start_pipeline_job(py_exe, shim_path: Path, cwd: Path):
     }
     st.session_state["__proc_pid__"] = proc.pid
 
-# --- NOVO: detectar processo zumbi e ler status do shim ---
-def _proc_alive(pid: int) -> bool:
-    try:
-        p = Path(f"/proc/{pid}/stat")
-        if p.exists():
-            parts = p.read_text().split()
-            # Campo 3 = state; 'Z' = zombie
-            if len(parts) > 2 and parts[2] == 'Z':
-                return False
-        os.kill(pid, 0)  # existe e não é zumbi
-        return True
-    except Exception:
-        return False
-
-def _reap_child(pid: int):
-    try:
-        # Recolhe o zumbi se presente
-        os.waitpid(pid, os.WNOHANG)
-    except Exception:
-        pass
-
-def _shim_status(run_dir: Path):
-    p = run_dir / "shim_status.json"
-    if p.exists():
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            return {"status": "error", "message": "shim_status.json ilegível"}
-    return None
-
 def _poll_job_status():
     job = st.session_state.get("job")
     if not job or job.get("status") != "running":
         return job
-
     run_dir = Path(job["run_dir"])
     pid = job.get("pid")
-
-    # 1) Se o shim já escreveu status, consideramos finalizado (mesmo se zumbi)
-    stat = _shim_status(run_dir)
-    if stat:
-        _reap_child(pid or -1)
-        job["rc"] = 0 if stat.get("status") == "ok" else 1
-        job["status"] = "finished"
-        st.session_state["job"] = job
-        return job
-
-    # 2) Watchdog de tempo total
-    elapsed = time.time() - float(job.get("start_ts", time.time()))
-    if elapsed > MAX_JOB_SECONDS:
-        try:
-            pgid = os.getpgid(pid)
-            os.killpg(pgid, signal.SIGTERM)
-            time.sleep(0.5)
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except Exception:
-                pass
-        except Exception:
-            pass
-        _reap_child(pid or -1)
-        job["status"] = "canceled"
-        st.session_state["job"] = job
-        st.warning(f"Job cancelado automaticamente após {int(elapsed)}s (limite {MAX_JOB_SECONDS}s).")
-        return job
-
-    # 3) Checagem de vida (tratando zumbi como morto)
     if pid is None:
         job["status"] = "unknown"
         st.session_state["job"] = job
         return job
-
-    alive = _proc_alive(pid)
+    alive = True
+    try:
+        os.kill(pid, 0)
+    except Exception:
+        alive = False
     if not alive:
-        _reap_child(pid)
         ctx_json = run_dir / "context_summary.json"
         rc = 0 if ctx_json.exists() else 1
         job["rc"] = rc
         job["status"] = "finished"
         st.session_state["job"] = job
         return job
-
     return job
 
 def _tail_file(path: Path, max_bytes=40000):  # tail mais leve
@@ -457,8 +404,6 @@ def _cancel_job():
             pass
     except Exception:
         pass
-    _reap_child(pid or -1)
-    # Marca como cancelado
     job["status"] = "canceled"
     st.session_state["job"] = job
 
