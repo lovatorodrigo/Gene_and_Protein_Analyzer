@@ -24,6 +24,9 @@ import streamlit.components.v1 as components  # <-- para keepalive
 # ==== Config inicial ====
 st.set_page_config(page_title="Effatha — Functional Regions", layout="wide")
 
+# Limite de tempo (watchdog) para evitar jobs eternos (90 min padrão)
+MAX_JOB_SECONDS = int(os.getenv("MAX_JOB_SECONDS", "5400"))
+
 # Wrapper de rerun compatível (Streamlit novo/antigo)
 def _safe_rerun():
     try:
@@ -224,12 +227,22 @@ def write_shim(run_dir: Path, module_path, cfg_overrides):
     cfg_path.write_text(json.dumps(cfg_overrides, indent=2, ensure_ascii=False), encoding="utf-8")
 
     shim_code = f"""# AUTO-GERADO pelo app Streamlit (não editar)
-import json, sys, importlib.util, pathlib, traceback
+import json, sys, importlib.util, pathlib, traceback, time
 try:
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 except Exception:
     pass
+
+run_dir = pathlib.Path(__file__).resolve().parent
+status_path = run_dir / "shim_status.json"
+
+def write_status(status, message=None):
+    try:
+        payload = {{"status": status, "message": message, "ts": time.time()}}
+        status_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
 
 def deep_update(d, u):
     for k, v in (u or {{}}).items():
@@ -238,34 +251,50 @@ def deep_update(d, u):
         else:
             d[k] = v
 
-module_path = r\"\"\"{Path(module_path).resolve()}\"\"\"
-spec = importlib.util.spec_from_file_location("pipeline_mod", module_path)
+module_path = r\"\"\"{Path(module_path).resolve()}\"\"\"\nspec = importlib.util.spec_from_file_location("pipeline_mod", module_path)
 if spec is None or spec.loader is None:
+    write_status("error", "Falha ao carregar spec: " + module_path)
     raise RuntimeError("Falha ao carregar spec para o pipeline: " + module_path)
 
 mod = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = mod
 try:
     spec.loader.exec_module(mod)
-except Exception:
+except SystemExit as se:
+    write_status("error", f"SystemExit ao carregar módulo: {{se}}")
+    raise
+except Exception as e:
     traceback.print_exc()
+    write_status("error", f"Exceção ao carregar módulo: {{e}}")
     raise
 
-with open("cfg_overrides.json", "r", encoding="utf-8") as fh:
-    overrides = json.load(fh)
-deep_update(mod.CONFIG, overrides)
+try:
+    with open("cfg_overrides.json", "r", encoding="utf-8") as fh:
+        overrides = json.load(fh)
+    deep_update(mod.CONFIG, overrides)
 
-src = (mod.CONFIG["input"]["source"] or "").lower()
-if src == "uniprot":
-    mod.run_from_uniprot(mod.CONFIG["input"]["uniprot_acc"])
-elif src == "pdb":
-    mod.run_from_pdb(mod.CONFIG["input"]["pdb_id"])
-elif src == "ncbi_protein":
-    mod.run_from_ncbi_protein(mod.CONFIG["input"]["ncbi_protein_acc"])
-elif src == "ncbi_gene":
-    mod.run_from_ncbi_gene(mod.CONFIG["input"]["gene"])
-else:
-    raise ValueError("CONFIG['input']['source'] deve ser 'pdb' | 'uniprot' | 'ncbi_protein' | 'ncbi_gene'.")
+    src = (mod.CONFIG["input"]["source"] or "").lower()
+    if src == "uniprot":
+        mod.run_from_uniprot(mod.CONFIG["input"]["uniprot_acc"])
+    elif src == "pdb":
+        mod.run_from_pdb(mod.CONFIG["input"]["pdb_id"])
+    elif src == "ncbi_protein":
+        mod.run_from_ncbi_protein(mod.CONFIG["input"]["ncbi_protein_acc"])
+    elif src == "ncbi_gene":
+        mod.run_from_ncbi_gene(mod.CONFIG["input"]["gene"])
+    else:
+        write_status("error", "CONFIG['input']['source'] inválido")
+        raise ValueError("CONFIG['input']['source'] deve ser 'pdb' | 'uniprot' | 'ncbi_protein' | 'ncbi_gene'.")
+
+    # Se chegamos aqui, o pipeline retornou sem exceção:
+    write_status("ok", "pipeline finalizado")
+except SystemExit as se:
+    write_status("error", f"SystemExit durante run: {{se}}")
+    raise
+except Exception as e:
+    traceback.print_exc()
+    write_status("error", f"Exceção durante run: {{e}}")
+    raise
 """
     shim_path = run_dir / "shim_run.py"
     shim_path.write_text(shim_code, encoding="utf-8")
@@ -314,28 +343,88 @@ def _start_pipeline_job(py_exe, shim_path: Path, cwd: Path):
     }
     st.session_state["__proc_pid__"] = proc.pid
 
+# --- NOVO: detectar processo zumbi e ler status do shim ---
+def _proc_alive(pid: int) -> bool:
+    try:
+        p = Path(f"/proc/{pid}/stat")
+        if p.exists():
+            parts = p.read_text().split()
+            # Campo 3 = state; 'Z' = zombie
+            if len(parts) > 2 and parts[2] == 'Z':
+                return False
+        os.kill(pid, 0)  # existe e não é zumbi
+        return True
+    except Exception:
+        return False
+
+def _reap_child(pid: int):
+    try:
+        # Recolhe o zumbi se presente
+        os.waitpid(pid, os.WNOHANG)
+    except Exception:
+        pass
+
+def _shim_status(run_dir: Path):
+    p = run_dir / "shim_status.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {"status": "error", "message": "shim_status.json ilegível"}
+    return None
+
 def _poll_job_status():
     job = st.session_state.get("job")
     if not job or job.get("status") != "running":
         return job
+
     run_dir = Path(job["run_dir"])
     pid = job.get("pid")
+
+    # 1) Se o shim já escreveu status, consideramos finalizado (mesmo se zumbi)
+    stat = _shim_status(run_dir)
+    if stat:
+        _reap_child(pid or -1)
+        job["rc"] = 0 if stat.get("status") == "ok" else 1
+        job["status"] = "finished"
+        st.session_state["job"] = job
+        return job
+
+    # 2) Watchdog de tempo total
+    elapsed = time.time() - float(job.get("start_ts", time.time()))
+    if elapsed > MAX_JOB_SECONDS:
+        try:
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, signal.SIGTERM)
+            time.sleep(0.5)
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        _reap_child(pid or -1)
+        job["status"] = "canceled"
+        st.session_state["job"] = job
+        st.warning(f"Job cancelado automaticamente após {int(elapsed)}s (limite {MAX_JOB_SECONDS}s).")
+        return job
+
+    # 3) Checagem de vida (tratando zumbi como morto)
     if pid is None:
         job["status"] = "unknown"
         st.session_state["job"] = job
         return job
-    alive = True
-    try:
-        os.kill(pid, 0)
-    except Exception:
-        alive = False
+
+    alive = _proc_alive(pid)
     if not alive:
+        _reap_child(pid)
         ctx_json = run_dir / "context_summary.json"
         rc = 0 if ctx_json.exists() else 1
         job["rc"] = rc
         job["status"] = "finished"
         st.session_state["job"] = job
         return job
+
     return job
 
 def _tail_file(path: Path, max_bytes=40000):  # tail mais leve
@@ -368,6 +457,8 @@ def _cancel_job():
             pass
     except Exception:
         pass
+    _reap_child(pid or -1)
+    # Marca como cancelado
     job["status"] = "canceled"
     st.session_state["job"] = job
 
