@@ -301,6 +301,22 @@ except Exception as e:
     traceback.print_exc()
     _log(f"EXCEPTION during run: {{e}}")
     raise
+
+# [ADDED] Se chegou até aqui sem exceção: sinaliza conclusão e encerra o processo
+try:
+    with open("done.ok", "w", encoding="utf-8") as _f:
+        _f.write("ok\\n")
+except Exception:
+    pass
+
+_log("shim done.ok gravado; encerrando processo")
+
+try:
+    sys.stdout.flush(); sys.stderr.flush()
+except Exception:
+    pass
+
+os._exit(0)
 """
     shim_path = run_dir / "shim_run.py"
     shim_path.write_text(shim_code, encoding="utf-8")
@@ -356,10 +372,28 @@ def _poll_job_status():
         return job
     run_dir = Path(job["run_dir"])
     pid = job.get("pid")
+
+    # [ADDED] Sentinel de conclusão pelo shim
+    done_ok = (run_dir / "done.ok").exists()
+    if done_ok:
+        # tenta encerrar gentilmente o grupo (pai + filhos), se ainda vivo
+        try:
+            if pid is not None:
+                pgid = os.getpgid(pid)
+                os.killpg(pgid, signal.SIGTERM)
+        except Exception:
+            pass
+        ctx_json = run_dir / "context_summary.json"
+        job["rc"] = 0 if ctx_json.exists() else 1
+        job["status"] = "finished"
+        st.session_state["job"] = job
+        return job
+
     if pid is None:
         job["status"] = "unknown"
         st.session_state["job"] = job
         return job
+
     alive = True
     try:
         os.kill(pid, 0)
@@ -1252,7 +1286,7 @@ Para **cada sequência** abaixo:
 - **Tamanho (aa)**: {protein.get('length','?')}
 - **Camadas ativas no Analyzer**:
   - UniProt VARIANT = { "ON" if layers.get("uniprot_variant_enabled") else "OFF" }
-  - Proteins Variation API = { "ON" if layers.get("proteins_variation_enabled") else "OFF" }
+  - Proteins Variation = { "ON" if layers.get("proteins_variation_enabled") else "OFF" }
   - BLAST = { "ON" if layers.get("blast_enabled") else "OFF" }
 - **BLAST (resumo)**: pos_var(blast)={blast.get('variant_positions_blast',0)}
 
